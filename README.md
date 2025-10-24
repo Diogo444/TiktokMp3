@@ -1,84 +1,80 @@
 # TikTok MP3 - Monorepo
 
-Application complète pour télécharger et convertir des vidéos TikTok en MP3.
+Application web pour convertir rapidement une video TikTok publique en MP3 et la telecharger depuis un iPhone.
 
-## 📁 Structure du Projet
+## Structure du projet
 
 ```
 TiktokMp3/
-├── packages/
-│   ├── frontend/          # Application Vue.js
-│   └── backend/           # API Node.js + Express
-├── package.json           # Configuration du monorepo
-└── pnpm-lock.yaml
+├─ packages/
+│  ├─ frontend/   # Application Vue 3 (Vite)
+│  └─ backend/    # API Node.js + Express
+├─ docker-compose.yml
+├─ pnpm-lock.yaml
+└─ pnpm-workspace.yaml
 ```
 
-## 🚀 Installation
+## Prerequis
 
-Ce projet utilise **pnpm** avec les workspaces pour gérer le monorepo.
+- Node.js >= 18
+- pnpm >= 8
+
+## Installation locale
 
 ```bash
-# Installer toutes les dépendances
 pnpm install
 ```
 
-## 🛠️ Développement
+## Scripts de developpement
 
-### Lancer tout le projet (frontend + backend)
+- Lancer les deux services : `pnpm dev`
+- Frontend uniquement : `pnpm dev:frontend` (http://localhost:5173)
+- Backend uniquement : `pnpm dev:backend` (http://localhost:3000)
 
-```bash
-pnpm dev
-```
+## Build
 
-### Lancer uniquement le frontend
+- Frontend : `pnpm build:frontend`
+- Tous les packages : `pnpm build`
 
-```bash
-pnpm dev:frontend
-```
+## Deploiement Docker
 
-Le frontend sera accessible sur http://localhost:5173
+Deux images sont fournies :
+- `packages/backend/Dockerfile` : serveur Express qui interroge TikTok et streame l'audio.
+- `packages/frontend/Dockerfile` : build Vite puis diffusion statique via Nginx.
 
-### Lancer uniquement le backend
+Le `docker-compose.yml` assemble ces images et suppose un reseau externe `caddy_net` (utile pour Caddy ou un reverse proxy).
 
-```bash
-pnpm dev:backend
-```
-
-Le backend sera accessible sur http://localhost:3000
-
-## 📦 Build
-
-### Build du frontend
+### Preparation
 
 ```bash
-pnpm build:frontend
+# creer le reseau une seule fois (si besoin)
+docker network create caddy_net
 ```
 
-### Build complet
+Optionnel : definir un fichier `.env` a la racine pour surcharger les variables (valeurs par defaut ci-dessous) :
+
+```
+PORT=3000
+FRONTEND_ORIGIN=http://frontend.localhost
+VITE_API_BASE_URL=http://backend:3000
+TIKTOK_METADATA_ENDPOINT=https://www.tikwm.com/api/
+API_TIMEOUT_MS=15000
+AUDIO_TIMEOUT_MS=30000
+```
+
+### Build et lancement
 
 ```bash
-pnpm build
+docker compose up --build
 ```
 
-## 📚 Documentation
+Les services ne publient pas de ports directement. Assurez-vous que votre reverse proxy sur `caddy_net` redirige vers :
+- `backend:3000` pour l'API
+- `frontend:80` pour l'interface web (servie par Nginx)
 
-- [Frontend README](./packages/frontend/)
+Le build frontend injecte l'URL de l'API via l'argument `VITE_API_BASE_URL`. Ajustez-le si l'API est exposee sur une adresse differente.
+
+## Documentation additionnelle
+
+- [Frontend README](./packages/frontend/README.md)
 - [Backend README](./packages/backend/README.md)
-
-## 🔧 Technologies
-
-### Frontend
-- Vue 3
-- Vite
-- JavaScript
-
-### Backend
-- Node.js
-- Express
-- CORS
-- dotenv
-
-## 📝 Prérequis
-
-- Node.js >= 18.0.0
-- pnpm >= 8.0.0
