@@ -10,27 +10,6 @@ const result = ref(null);
 const audioObjectUrl = ref('');
 const downloadError = ref('');
 
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL ?? ''
-).trim().replace(/\/$/, '');
-
-const makeApiUrl = (path) => {
-  if (!path) {
-    return path;
-  }
-  if (/^https?:\/\//i.test(path)) {
-    return path;
-  }
-  if (API_BASE_URL) {
-    try {
-      return new URL(path, API_BASE_URL).toString();
-    } catch (error) {
-      console.warn('Invalid API base URL, fallback to relative path.', error);
-    }
-  }
-  return path.startsWith('/') ? path : `/${path}`;
-};
-
 const IOS_USER_AGENT_MATCH =
   /iPad|iPhone|iPod/.test(navigator.userAgent) ||
   (navigator.userAgent.includes('Mac') && navigator.maxTouchPoints > 2);
@@ -62,8 +41,9 @@ const toAbsoluteUrl = (pathOrUrl) => {
     if (isAbsolute) {
       return pathOrUrl;
     }
-    const resolved = makeApiUrl(pathOrUrl);
-    return new URL(resolved, window.location.origin).toString();
+    // En développement, on utilise les URLs relatives pour le proxy Vite
+    // En production, on construit l'URL complète avec window.location.origin
+    return new URL(pathOrUrl, window.location.origin).toString();
   } catch (error) {
     return pathOrUrl;
   }
