@@ -15,12 +15,8 @@ const TIKTOK_METADATA_ENDPOINT =
 const API_RESPONSE_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS ?? 15000);
 
 // Middleware
-app.use(
-  cors({
-    origin: process.env.FRONTEND_ORIGIN || '*',
-    methods: ['GET', 'POST'],
-  }),
-);
+app.use(cors());
+app.options('*', cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
