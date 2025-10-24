@@ -1,0 +1,26 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: packages/backend/Dockerfile
+    environment:
+      PORT: ${PORT:-3000}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
+      TIKTOK_METADATA_ENDPOINT: ${TIKTOK_METADATA_ENDPOINT:-https://www.tikwm.com/api/}
+      API_TIMEOUT_MS: ${API_TIMEOUT_MS:-15000}
+      AUDIO_TIMEOUT_MS: ${AUDIO_TIMEOUT_MS:-30000}
+    ports:
+      - "${PORT:-3000}:3000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: packages/frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3000}
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    restart: unless-stopped

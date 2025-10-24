@@ -1,0 +1,21 @@
+{
+  "name": "tiktokmp3-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TikTok MP3 Monorepo - Frontend & Backend",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "pnpm --parallel -r dev",
+    "dev:frontend": "pnpm --filter @tiktokmp3/frontend dev",
+    "dev:backend": "pnpm --filter @tiktokmp3/backend dev",
+    "build": "pnpm -r build",
+    "build:frontend": "pnpm --filter @tiktokmp3/frontend build",
+    "install:all": "pnpm install"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  }
+}
