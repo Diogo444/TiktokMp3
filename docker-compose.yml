@@ -1,5 +1,8 @@
+version: "3.9"
+
 services:
-  backend:
+  tiktokmp3-backend:
+    container_name: tiktokmp3-backend
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
@@ -13,14 +16,15 @@ services:
     networks:
       - caddy_net
 
-  frontend:
+  tiktokmp3-frontend:
+    container_name: tiktokmp3-frontend
     build:
       context: .
       dockerfile: packages/frontend/Dockerfile
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3000}
     depends_on:
-      - backend
+      - tiktokmp3-backend
     restart: unless-stopped
     networks:
       - caddy_net
