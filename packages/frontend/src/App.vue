@@ -10,8 +10,26 @@ const result = ref(null);
 const audioObjectUrl = ref('');
 const downloadError = ref('');
 
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL?.trim() || window.location.origin;
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL ?? ''
+).trim().replace(/\/$/, '');
+
+const makeApiUrl = (path) => {
+  if (!path) {
+    return path;
+  }
+  if (/^https?:\/\//i.test(path)) {
+    return path;
+  }
+  if (API_BASE_URL) {
+    try {
+      return new URL(path, API_BASE_URL).toString();
+    } catch (error) {
+      console.warn('Invalid API base URL, fallback to relative path.', error);
+    }
+  }
+  return path.startsWith('/') ? path : `/${path}`;
+};
 
 const IOS_USER_AGENT_MATCH =
   /iPad|iPhone|iPod/.test(navigator.userAgent) ||
@@ -37,7 +55,15 @@ onBeforeUnmount(() => {
 
 const toAbsoluteUrl = (pathOrUrl) => {
   try {
-    return new URL(pathOrUrl, API_BASE_URL).toString();
+    if (!pathOrUrl) {
+      return pathOrUrl;
+    }
+    const isAbsolute = /^https?:\/\//i.test(pathOrUrl);
+    if (isAbsolute) {
+      return pathOrUrl;
+    }
+    const resolved = makeApiUrl(pathOrUrl);
+    return new URL(resolved, window.location.origin).toString();
   } catch (error) {
     return pathOrUrl;
   }
@@ -103,7 +129,7 @@ const handleSubmit = async () => {
   downloadError.value = '';
 
   try {
-    const response = await fetch(`${API_BASE_URL}/api/convert`, {
+    const response = await fetch(makeApiUrl('/api/convert'), {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -162,7 +188,7 @@ const downloadAudio = async () => {
   downloadError.value = '';
 
   try {
-    const response = await fetch(result.value.downloadUrl);
+    const response = await fetch(makeApiUrl(result.value.downloadUrl));
     if (!response.ok) {
       throw new Error(
         'Impossible de récupérer le fichier audio. Tentez une nouvelle fois.',
