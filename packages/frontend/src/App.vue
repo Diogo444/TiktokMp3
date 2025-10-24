@@ -129,7 +129,7 @@ const handleSubmit = async () => {
   downloadError.value = '';
 
   try {
-    const response = await fetch(makeApiUrl('/api/convert'), {
+    const response = await fetch('/api/convert', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -188,7 +188,7 @@ const downloadAudio = async () => {
   downloadError.value = '';
 
   try {
-    const response = await fetch(makeApiUrl(result.value.downloadUrl));
+    const response = await fetch(result.value.downloadUrl);
     if (!response.ok) {
       throw new Error(
         'Impossible de récupérer le fichier audio. Tentez une nouvelle fois.',
