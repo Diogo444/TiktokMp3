@@ -204,10 +204,7 @@ app.get('/api/download', async (req, res) => {
       });
     }
 
-    res.setHeader(
-      'Content-Type',
-      upstreamResponse.headers.get('content-type') || 'audio/mpeg',
-    );
+    res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp3"`);
     res.setHeader('Cache-Control', 'no-store');
 

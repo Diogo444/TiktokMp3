@@ -182,8 +182,11 @@ const downloadAudio = async () => {
       );
     }
 
+    // Forcer le type MIME à audio/mpeg pour éviter .mp3.mp4
+    const mp3Blob = new Blob([blob], { type: 'audio/mpeg' });
+
     revokeAudioUrl();
-    const objectUrl = URL.createObjectURL(blob);
+    const objectUrl = URL.createObjectURL(mp3Blob);
     audioObjectUrl.value = objectUrl;
 
     if (isIOS.value) {
