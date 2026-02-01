@@ -191,14 +191,6 @@ const isCommandAvailable = (command) => {
   }
 };
 
-const YOUTUBE_PROVIDER = (() => {
-  const configured = (process.env.YOUTUBE_PROVIDER || '').trim().toLowerCase();
-  if (!configured || configured === 'auto') {
-    return 'yt-dlp';
-  }
-  return configured;
-})();
-
 const runCommand = async (command, args, options = {}) =>
   new Promise((resolve, reject) => {
     const child = spawn(command, args, {
