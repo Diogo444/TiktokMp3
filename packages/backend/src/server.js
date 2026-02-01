@@ -284,10 +284,16 @@ const getYtDlpInfo = async (videoUrl, requestedFormat) => {
    
   // Add PO Token provider if configured
   if (potProviderUrl) {
+    // Use mweb client which works better with PO Tokens
+    args.push('--extractor-args', `youtube:player-client=mweb`);
     args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${potProviderUrl}`);
+    console.log(`[yt-dlp] Using PO Token provider: ${potProviderUrl}`);
+  } else if (!cookiesFile) {
+    console.warn('[yt-dlp] No PO Token provider or cookies configured - YouTube may block requests');
   }
   
   args.push(videoUrl);
+  console.log(`[yt-dlp] Running with args: ${args.filter(a => !a.includes('cookie')).join(' ')}`);
 
   const { stdout, stderr } = await runCommand(
     'yt-dlp',
