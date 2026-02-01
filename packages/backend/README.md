@@ -12,7 +12,7 @@ pnpm install
 
 - FFmpeg (conversion YouTube → mp3/mp4)
 - Option pnpm : si les scripts sont bloqués, lancez `pnpm approve-builds` et autorisez `ffmpeg-static`, ou installez FFmpeg et définissez `FFMPEG_PATH`.
-- Conseil : `@distube/ytdl-core` peut casser quand YouTube change. Le backend peut utiliser `yt-dlp` si disponible via `YOUTUBE_PROVIDER=yt-dlp` (recommandé).
+- Le backend supporte `yt-dlp` (recommandé) et `@distube/ytdl-core` (fallback Node). Configurez `YOUTUBE_PROVIDER` selon votre environnement (`auto`, `yt-dlp`, `ytdl-core`).
 
 ### Erreur YouTube "Sign in to confirm you’re not a bot"
 

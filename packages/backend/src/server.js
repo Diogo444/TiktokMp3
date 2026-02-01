@@ -196,7 +196,7 @@ const YOUTUBE_PROVIDER = (() => {
   if (configured) {
     return configured;
   }
-  return isCommandAvailable('yt-dlp') ? 'yt-dlp' : 'ytdl';
+  return isCommandAvailable('yt-dlp') ? 'yt-dlp' : 'ytdl-core';
 })();
 
 const runCommand = async (command, args, options = {}) =>
@@ -253,6 +253,48 @@ const toFfmpegHeadersValue = (headers = {}) => {
 const isYouTubeBotProtectionError = (stderr = '') =>
   typeof stderr === 'string' &&
   /sign in to confirm you.?re not a bot/i.test(stderr);
+
+const loadYtdlCore = async () => {
+  try {
+    return await import('@distube/ytdl-core');
+  } catch {
+    return await import('ytdl-core');
+  }
+};
+
+const unwrapYtdlCoreModule = (module) => module?.default || module;
+
+const isLikelyYouTubeBlockedError = (error) => {
+  const message = (error?.message || '').toString();
+  const status = Number(error?.statusCode ?? error?.status ?? 0);
+  return (
+    /sign in to confirm you.?re not a bot/i.test(message) ||
+    /captcha/i.test(message) ||
+    status === 403 ||
+    status === 429
+  );
+};
+
+const getYtdlCoreMetadata = async (videoUrl) => {
+  const mod = await loadYtdlCore();
+  const ytdl = unwrapYtdlCoreModule(mod);
+  const info = await ytdl.getInfo(videoUrl);
+  const details = info?.videoDetails || {};
+
+  const title = details?.title?.toString?.().trim?.();
+  const author =
+    details?.author?.name?.toString?.().trim?.() ||
+    details?.ownerChannelName?.toString?.().trim?.() ||
+    details?.author?.toString?.().trim?.();
+  const durationSeconds = Number(details?.lengthSeconds);
+  const duration = Number.isFinite(durationSeconds) ? durationSeconds : undefined;
+  const cover =
+    details?.thumbnails?.at?.(-1)?.url ||
+    details?.thumbnails?.[0]?.url ||
+    undefined;
+
+  return { title, author, duration, cover, info };
+};
 
 const getYtDlpInfo = async (videoUrl, requestedFormat) => {
   const formatSelector =
@@ -473,15 +515,12 @@ app.post('/api/convert', async (req, res) => {
     }
 
     const youtubeWatchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-
-    // yt-dlp est requis pour YouTube (ytdl-core est déprécié/archivé)
-    if (!isCommandAvailable('yt-dlp')) {
-      console.error('yt-dlp is not available on this server');
-      return res.status(500).json({
-        error: ERROR_MESSAGES.ytdlpMissing,
-        code: 'YTDLP_MISSING',
-      });
-    }
+    const resolvedYouTubeProvider =
+      YOUTUBE_PROVIDER === 'auto'
+        ? isCommandAvailable('yt-dlp')
+          ? 'yt-dlp'
+          : 'ytdl-core'
+        : YOUTUBE_PROVIDER;
 
     let title = 'YouTube Audio';
     let author = 'YouTube';
@@ -489,29 +528,74 @@ app.post('/api/convert', async (req, res) => {
     let cover = undefined;
 
     try {
-      const ytdlpPayload = await getYtDlpInfo(youtubeWatchUrl, format);
-      title = ytdlpPayload?.title?.trim?.() || title;
-      author =
-        ytdlpPayload?.uploader?.trim?.() ||
-        ytdlpPayload?.channel?.trim?.() ||
-        ytdlpPayload?.creator?.trim?.() ||
-        author;
-      duration =
-        typeof ytdlpPayload?.duration === 'number'
-          ? ytdlpPayload.duration
-          : duration;
-      cover =
-        ytdlpPayload?.thumbnail ||
-        ytdlpPayload?.thumbnails?.at(-1)?.url ||
-        ytdlpPayload?.thumbnails?.[0]?.url ||
-        cover;
+      if (resolvedYouTubeProvider === 'yt-dlp') {
+        if (!isCommandAvailable('yt-dlp')) {
+          console.error('yt-dlp is not available on this server');
+          return res.status(500).json({
+            error: ERROR_MESSAGES.ytdlpMissing,
+            code: 'YTDLP_MISSING',
+          });
+        }
+
+        const ytdlpPayload = await getYtDlpInfo(youtubeWatchUrl, format);
+        title = ytdlpPayload?.title?.trim?.() || title;
+        author =
+          ytdlpPayload?.uploader?.trim?.() ||
+          ytdlpPayload?.channel?.trim?.() ||
+          ytdlpPayload?.creator?.trim?.() ||
+          author;
+        duration =
+          typeof ytdlpPayload?.duration === 'number'
+            ? ytdlpPayload.duration
+            : duration;
+        cover =
+          ytdlpPayload?.thumbnail ||
+          ytdlpPayload?.thumbnails?.at(-1)?.url ||
+          ytdlpPayload?.thumbnails?.[0]?.url ||
+          cover;
+      } else if (resolvedYouTubeProvider === 'ytdl-core') {
+        const meta = await getYtdlCoreMetadata(youtubeWatchUrl);
+        title = meta?.title || title;
+        author = meta?.author || author;
+        duration = meta?.duration ?? duration;
+        cover = meta?.cover || cover;
+      } else {
+        return res.status(500).json({
+          error: `YouTube provider invalide: ${resolvedYouTubeProvider}`,
+          code: 'YOUTUBE_PROVIDER_INVALID',
+        });
+      }
     } catch (error) {
-      console.error('yt-dlp metadata error:', error);
+      console.error('YouTube metadata error:', error);
+
       if (isYouTubeBotProtectionError(error?.stderr)) {
+        if (YOUTUBE_PROVIDER === 'auto') {
+          try {
+            const meta = await getYtdlCoreMetadata(youtubeWatchUrl);
+            title = meta?.title || title;
+            author = meta?.author || author;
+            duration = meta?.duration ?? duration;
+            cover = meta?.cover || cover;
+          } catch (fallbackError) {
+            console.error('YouTube metadata fallback (ytdl-core) error:', fallbackError);
+            return res.status(403).json({
+              error:
+                'YouTube demande une validation "anti-bot" depuis ce serveur. Configurez des cookies (YTDLP_COOKIES_FILE) ou utilisez une IP/réseau différent, puis réessayez.',
+              code: 'YOUTUBE_AUTH_REQUIRED',
+            });
+          }
+        } else {
+          return res.status(403).json({
+            error:
+              'YouTube demande une validation "anti-bot" depuis ce serveur. Configurez des cookies (YTDLP_COOKIES_FILE) ou utilisez une IP/réseau différent, puis réessayez.',
+            code: 'YOUTUBE_AUTH_REQUIRED',
+          });
+        }
+      } else if (isLikelyYouTubeBlockedError(error)) {
         return res.status(403).json({
           error:
-            'YouTube demande une validation "anti-bot" depuis ce serveur. Configurez des cookies (YTDLP_COOKIES_FILE) ou utilisez une IP/réseau différent, puis réessayez.',
-          code: 'YOUTUBE_AUTH_REQUIRED',
+            'YouTube refuse la requête depuis ce serveur (anti-bot / rate-limit). Essayez une autre IP/réseau ou changez de provider (YOUTUBE_PROVIDER=ytdl-core).',
+          code: 'YOUTUBE_BLOCKED',
         });
       }
       return res.status(502).json({
@@ -599,13 +683,326 @@ app.get('/api/download', async (req, res) => {
       }
       const inputUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-      if (YOUTUBE_PROVIDER === 'yt-dlp' && isCommandAvailable('yt-dlp')) {
+      const resolvedYouTubeProvider =
+        YOUTUBE_PROVIDER === 'auto'
+          ? isCommandAvailable('yt-dlp')
+            ? 'yt-dlp'
+            : 'ytdl-core'
+          : YOUTUBE_PROVIDER;
+
+      const downloadWithYtdlCore = async () => {
+        let ytdl;
+        let info;
+        try {
+          const mod = await loadYtdlCore();
+          ytdl = unwrapYtdlCoreModule(mod);
+          const meta = await getYtdlCoreMetadata(inputUrl);
+          info = meta.info;
+        } catch (error) {
+          console.error('ytdl-core info error:', error);
+          if (isLikelyYouTubeBlockedError(error)) {
+            return res.status(403).json({
+              error:
+                'YouTube refuse la requête depuis ce serveur (anti-bot / rate-limit). Essayez une autre IP/réseau.',
+              code: 'YOUTUBE_BLOCKED',
+            });
+          }
+          return res.status(502).json({
+            error: ERROR_MESSAGES.youtubeStreamFailed,
+            code: 'YOUTUBE_STREAM_FAILED',
+          });
+        }
+
+        const audioBitrate = process.env.YOUTUBE_AUDIO_BITRATE || '192k';
+
+        if (format === 'mp3') {
+          const ffmpegArgs = [
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-i',
+            'pipe:0',
+            '-vn',
+            '-acodec',
+            'libmp3lame',
+            '-b:a',
+            audioBitrate,
+            '-f',
+            'mp3',
+            'pipe:1',
+          ];
+
+          const ffmpeg = spawn(ffmpegPath, ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+          res.setHeader('Content-Type', 'audio/mpeg');
+          res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp3"`);
+          res.setHeader('Cache-Control', 'no-store');
+
+          ffmpeg.stderr.on('data', (chunk) => {
+            const message = chunk?.toString?.() || '';
+            if (message.trim()) {
+              console.error('ffmpeg stderr:', message.trim());
+            }
+          });
+
+          ffmpeg.on('error', (error) => {
+            console.error('ffmpeg spawn error:', error);
+            res.destroy(error);
+          });
+
+          res.on('close', () => {
+            if (!res.writableEnded) {
+              try {
+                ffmpeg.kill('SIGKILL');
+              } catch {
+                // ignore
+              }
+            }
+          });
+
+          const audioStream = ytdl.downloadFromInfo(info, { quality: 'highestaudio' });
+          audioStream.on('error', (error) => {
+            console.error('ytdl-core audio stream error:', error);
+            try {
+              ffmpeg.stdin.destroy(error);
+            } catch {
+              // ignore
+            }
+          });
+
+          ffmpeg.stdin.on('error', () => {
+            try {
+              audioStream.destroy();
+            } catch {
+              // ignore
+            }
+          });
+
+          audioStream.pipe(ffmpeg.stdin);
+
+          const outputPipeline = pipeline(ffmpeg.stdout, res);
+          const ffmpegExit = new Promise((resolve, reject) => {
+            ffmpeg.on('close', (code) => {
+              if (code === 0) {
+                resolve();
+              } else {
+                reject(new Error(`ffmpeg exited with code ${code}`));
+              }
+            });
+          });
+
+          await Promise.all([outputPipeline, ffmpegExit]).catch((error) => {
+            console.error('YouTube MP3 (ytdl-core) error:', error);
+            if (!res.headersSent) {
+              res.status(502).json({
+                error: 'La conversion audio YouTube a échoué. Réessayez dans quelques instants.',
+                code: 'YOUTUBE_MP3_FAILED',
+              });
+            } else {
+              res.destroy(error);
+            }
+          });
+
+          return;
+        }
+
+        // MP4: prefer a muxed mp4 stream if available, otherwise merge video+audio via ffmpeg pipes.
+        const muxedMp4 =
+          info?.formats
+            ?.filter((fmt) => fmt?.hasAudio && fmt?.hasVideo && fmt?.container === 'mp4')
+            ?.sort((a, b) => Number(b?.bitrate ?? 0) - Number(a?.bitrate ?? 0))?.[0] ||
+          null;
+
+        if (muxedMp4) {
+          res.setHeader('Content-Type', 'video/mp4');
+          res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
+          res.setHeader('Cache-Control', 'no-store');
+
+          const stream = ytdl.downloadFromInfo(info, { format: muxedMp4 });
+          stream.on('error', (error) => {
+            console.error('ytdl-core muxed mp4 stream error:', error);
+            res.destroy(error);
+          });
+
+          await pipeline(stream, res);
+          return;
+        }
+
+        const videoFormat =
+          info?.formats
+            ?.filter((fmt) => fmt?.hasVideo && !fmt?.hasAudio && fmt?.container === 'mp4')
+            ?.sort((a, b) => Number(b?.height ?? 0) - Number(a?.height ?? 0))?.[0] ||
+          info?.formats
+            ?.filter((fmt) => fmt?.hasVideo && !fmt?.hasAudio)
+            ?.sort((a, b) => Number(b?.height ?? 0) - Number(a?.height ?? 0))?.[0] ||
+          null;
+
+        const audioFormat =
+          info?.formats
+            ?.filter(
+              (fmt) =>
+                fmt?.hasAudio &&
+                !fmt?.hasVideo &&
+                (fmt?.container === 'm4a' || fmt?.container === 'mp4'),
+            )
+            ?.sort((a, b) => Number(b?.audioBitrate ?? 0) - Number(a?.audioBitrate ?? 0))?.[0] ||
+          info?.formats
+            ?.filter((fmt) => fmt?.hasAudio && !fmt?.hasVideo)
+            ?.sort((a, b) => Number(b?.audioBitrate ?? 0) - Number(a?.audioBitrate ?? 0))?.[0] ||
+          null;
+
+        if (!videoFormat || !audioFormat) {
+          return res.status(502).json({
+            error: ERROR_MESSAGES.youtubeStreamFailed,
+            code: 'YOUTUBE_STREAM_EMPTY',
+          });
+        }
+
+        const videoCodec = (videoFormat?.codecs || videoFormat?.codec || '')
+          .toString()
+          .toLowerCase();
+        const audioCodec = (audioFormat?.codecs || audioFormat?.codec || '')
+          .toString()
+          .toLowerCase();
+        const isH264 = videoCodec.includes('avc1') || videoCodec.includes('h264');
+        const isAac = audioCodec.includes('mp4a') || audioCodec.includes('aac');
+
+        const videoArgs = isH264
+          ? ['-c:v', 'copy']
+          : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'];
+        const audioArgs = isAac ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', audioBitrate];
+
+        const ffmpegArgs = [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-i',
+          'pipe:3',
+          '-i',
+          'pipe:4',
+          '-map',
+          '0:v:0',
+          '-map',
+          '1:a:0',
+          ...videoArgs,
+          ...audioArgs,
+          '-shortest',
+          '-f',
+          'mp4',
+          '-movflags',
+          'frag_keyframe+empty_moov',
+          'pipe:1',
+        ];
+
+        const ffmpeg = spawn(ffmpegPath, ffmpegArgs, {
+          stdio: ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
+        });
+        const videoPipe = ffmpeg.stdio[3];
+        const audioPipe = ffmpeg.stdio[4];
+
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp4"`);
+        res.setHeader('Cache-Control', 'no-store');
+
+        ffmpeg.stderr.on('data', (chunk) => {
+          const message = chunk?.toString?.() || '';
+          if (message.trim()) {
+            console.error('ffmpeg stderr:', message.trim());
+          }
+        });
+
+        ffmpeg.on('error', (error) => {
+          console.error('ffmpeg spawn error:', error);
+          res.destroy(error);
+        });
+
+        res.on('close', () => {
+          if (!res.writableEnded) {
+            try {
+              ffmpeg.kill('SIGKILL');
+            } catch {
+              // ignore
+            }
+          }
+        });
+
+        const videoStream = ytdl.downloadFromInfo(info, { format: videoFormat });
+        const audioStream = ytdl.downloadFromInfo(info, { format: audioFormat });
+
+        videoStream.on('error', (error) => {
+          console.error('ytdl-core video stream error:', error);
+          try {
+            videoPipe.destroy(error);
+          } catch {
+            // ignore
+          }
+        });
+
+        audioStream.on('error', (error) => {
+          console.error('ytdl-core audio stream error:', error);
+          try {
+            audioPipe.destroy(error);
+          } catch {
+            // ignore
+          }
+        });
+
+        videoPipe.on('error', () => {
+          try {
+            videoStream.destroy();
+          } catch {
+            // ignore
+          }
+        });
+
+        audioPipe.on('error', () => {
+          try {
+            audioStream.destroy();
+          } catch {
+            // ignore
+          }
+        });
+
+        videoStream.pipe(videoPipe);
+        audioStream.pipe(audioPipe);
+
+        const outputPipeline = pipeline(ffmpeg.stdout, res);
+        const ffmpegExit = new Promise((resolve, reject) => {
+          ffmpeg.on('close', (code) => {
+            if (code === 0) {
+              resolve();
+            } else {
+              reject(new Error(`ffmpeg exited with code ${code}`));
+            }
+          });
+        });
+
+        await Promise.all([outputPipeline, ffmpegExit]).catch((error) => {
+          console.error('YouTube MP4 (ytdl-core) error:', error);
+          if (!res.headersSent) {
+            res.status(502).json({
+              error: 'La conversion vidéo YouTube a échoué. Réessayez dans quelques instants.',
+              code: 'YOUTUBE_MP4_FAILED',
+            });
+          } else {
+            res.destroy(error);
+          }
+        });
+
+        return;
+      };
+
+      if (resolvedYouTubeProvider === 'yt-dlp' && isCommandAvailable('yt-dlp')) {
         let ytdlpPayload;
         try {
           ytdlpPayload = await getYtDlpInfo(inputUrl, format);
         } catch (error) {
           console.error('yt-dlp info error:', error);
           if (isYouTubeBotProtectionError(error?.stderr)) {
+            if (YOUTUBE_PROVIDER === 'auto') {
+              await downloadWithYtdlCore();
+              return;
+            }
             return res.status(403).json({
               error:
                 'YouTube demande une validation "anti-bot" depuis ce serveur. Configurez des cookies (YTDLP_COOKIES_FILE) ou utilisez une IP/réseau différent, puis réessayez.',
@@ -812,10 +1209,21 @@ app.get('/api/download', async (req, res) => {
         return;
       }
 
-      // yt-dlp is required for YouTube downloads
+      if (resolvedYouTubeProvider === 'ytdl-core') {
+        await downloadWithYtdlCore();
+        return;
+      }
+
+      // Provider not available / invalid
       return res.status(500).json({
-        error: 'yt-dlp n\'est pas disponible sur ce serveur. Contactez l\'administrateur.',
-        code: 'YTDLP_NOT_AVAILABLE',
+        error:
+          resolvedYouTubeProvider === 'yt-dlp'
+            ? 'yt-dlp n\'est pas disponible sur ce serveur. Contactez l\'administrateur.'
+            : `YouTube provider invalide: ${resolvedYouTubeProvider}`,
+        code:
+          resolvedYouTubeProvider === 'yt-dlp'
+            ? 'YTDLP_NOT_AVAILABLE'
+            : 'YOUTUBE_PROVIDER_INVALID',
       });
     }
 
