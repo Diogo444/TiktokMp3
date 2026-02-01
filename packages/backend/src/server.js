@@ -250,6 +250,10 @@ const toFfmpegHeadersValue = (headers = {}) => {
   return pairs.join('');
 };
 
+const isYouTubeBotProtectionError = (stderr = '') =>
+  typeof stderr === 'string' &&
+  /sign in to confirm you.?re not a bot/i.test(stderr);
+
 const getYtDlpInfo = async (videoUrl, requestedFormat) => {
   const formatSelector =
     requestedFormat === 'mp4'
@@ -258,7 +262,23 @@ const getYtDlpInfo = async (videoUrl, requestedFormat) => {
 
   const potProviderUrl = process.env.POT_PROVIDER_URL || '';
   const args = ['-J', '--no-playlist', '--skip-download', '-f', formatSelector];
-  
+
+  const cookiesFileFromEnv = (process.env.YTDLP_COOKIES_FILE || '').trim();
+  const defaultCookiesFile = '/run/secrets/youtube-cookies.txt';
+  const cookiesFile =
+    cookiesFileFromEnv ||
+    (existsSync(defaultCookiesFile) ? defaultCookiesFile : '');
+
+  if (cookiesFile) {
+    if (existsSync(cookiesFile)) {
+      args.push('--cookies', cookiesFile);
+    } else {
+      console.warn(
+        `YTDLP_COOKIES_FILE is set but file does not exist: ${cookiesFile}`,
+      );
+    }
+  }
+   
   // Add PO Token provider if configured
   if (potProviderUrl) {
     args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${potProviderUrl}`);
@@ -487,6 +507,13 @@ app.post('/api/convert', async (req, res) => {
         cover;
     } catch (error) {
       console.error('yt-dlp metadata error:', error);
+      if (isYouTubeBotProtectionError(error?.stderr)) {
+        return res.status(403).json({
+          error:
+            'YouTube demande une validation "anti-bot" depuis ce serveur. Configurez des cookies (YTDLP_COOKIES_FILE) ou utilisez une IP/réseau différent, puis réessayez.',
+          code: 'YOUTUBE_AUTH_REQUIRED',
+        });
+      }
       return res.status(502).json({
         error: ERROR_MESSAGES.youtubeMetadataFailed,
         code: 'YOUTUBE_METADATA_FAILED',
@@ -578,6 +605,13 @@ app.get('/api/download', async (req, res) => {
           ytdlpPayload = await getYtDlpInfo(inputUrl, format);
         } catch (error) {
           console.error('yt-dlp info error:', error);
+          if (isYouTubeBotProtectionError(error?.stderr)) {
+            return res.status(403).json({
+              error:
+                'YouTube demande une validation "anti-bot" depuis ce serveur. Configurez des cookies (YTDLP_COOKIES_FILE) ou utilisez une IP/réseau différent, puis réessayez.',
+              code: 'YOUTUBE_AUTH_REQUIRED',
+            });
+          }
           return res.status(502).json({
             error: ERROR_MESSAGES.youtubeStreamFailed,
             code: 'YOUTUBE_STREAM_FAILED',

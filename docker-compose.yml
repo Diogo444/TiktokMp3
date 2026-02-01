@@ -27,6 +27,8 @@ services:
       dockerfile: packages/backend/Dockerfile
     networks:
       - caddy_net
+    volumes:
+      - ./secrets:/run/secrets:ro
     depends_on:
       - tiktokmp3-pot-provider
     environment:
@@ -39,6 +41,7 @@ services:
       YOUTUBE_AUDIO_BITRATE: ${YOUTUBE_AUDIO_BITRATE:-192k}
       YOUTUBE_PROVIDER: ${YOUTUBE_PROVIDER:-yt-dlp}
       YTDLP_TIMEOUT_MS: ${YTDLP_TIMEOUT_MS:-45000}
+      YTDLP_COOKIES_FILE: ${YTDLP_COOKIES_FILE:-}
       POT_PROVIDER_URL: ${POT_PROVIDER_URL:-http://tiktokmp3-pot-provider:4416}
     restart: unless-stopped
 

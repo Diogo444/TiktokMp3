@@ -61,6 +61,7 @@ FFMPEG_PATH=
 YOUTUBE_AUDIO_BITRATE=192k
 YOUTUBE_PROVIDER=yt-dlp
 YTDLP_TIMEOUT_MS=45000
+YTDLP_COOKIES_FILE=
 ```
 
 ### Build et lancement
@@ -70,6 +71,16 @@ docker compose up --build
 ```
 
 Puis ouvrez `http://localhost:8080`. Caddy sert le frontend et reverse-proxy l'API.
+
+### Problème YouTube "Sign in to confirm you’re not a bot"
+
+Sur certaines IP (souvent VPS/datacenter), YouTube peut bloquer `yt-dlp` et demander une validation anti-bot.
+Dans ce cas, exportez vos cookies YouTube (format `cookies.txt` Netscape), placez-les dans `./secrets/youtube-cookies.txt`
+(dossier ignoré par git), puis relancez en définissant :
+
+```
+YTDLP_COOKIES_FILE=/run/secrets/youtube-cookies.txt
+```
 
 ## Documentation additionnelle
 

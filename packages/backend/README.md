@@ -14,6 +14,15 @@ pnpm install
 - Option pnpm : si les scripts sont bloqués, lancez `pnpm approve-builds` et autorisez `ffmpeg-static`, ou installez FFmpeg et définissez `FFMPEG_PATH`.
 - Conseil : `@distube/ytdl-core` peut casser quand YouTube change. Le backend peut utiliser `yt-dlp` si disponible via `YOUTUBE_PROVIDER=yt-dlp` (recommandé).
 
+### Erreur YouTube "Sign in to confirm you’re not a bot"
+
+Sur certaines IP (souvent VPS/datacenter), YouTube peut bloquer `yt-dlp` et demander une validation anti-bot.
+Dans ce cas, configurez un fichier de cookies (format `cookies.txt` Netscape) et définissez :
+
+```
+YTDLP_COOKIES_FILE=/run/secrets/youtube-cookies.txt
+```
+
 ## Configuration
 
 Copiez le fichier `.env.example` en `.env` et configurez vos variables d'environnement :

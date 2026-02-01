@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local secrets (ex: YouTube cookies for yt-dlp)
+secrets/
+youtube-cookies*.txt
+cookies*.txt
