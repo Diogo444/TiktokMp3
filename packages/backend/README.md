@@ -1,12 +1,18 @@
-# TikTok MP3 Backend
+# TikTok / YouTube MP3 Backend
 
-Backend API pour le projet TikTok MP3.
+Backend API pour le projet TikTok / YouTube MP3.
 
 ## Installation
 
 ```bash
 pnpm install
 ```
+
+## Prérequis (YouTube)
+
+- FFmpeg (conversion YouTube → mp3/mp4)
+- Option pnpm : si les scripts sont bloqués, lancez `pnpm approve-builds` et autorisez `ffmpeg-static`, ou installez FFmpeg et définissez `FFMPEG_PATH`.
+- Conseil : `@distube/ytdl-core` peut casser quand YouTube change. Le backend peut utiliser `yt-dlp` si disponible via `YOUTUBE_PROVIDER=yt-dlp` (recommandé).
 
 ## Configuration
 
@@ -32,6 +38,12 @@ Retourne un message de bienvenue
 ### GET /api/health
 Vérifie le statut de l'API
 
-### POST /api/download
-Télécharge une vidéo TikTok
-- Body: `{ "url": "https://tiktok.com/..." }`
+### POST /api/convert
+Détecte automatiquement TikTok vs YouTube et retourne les métadonnées + un lien de téléchargement.
+- Body: `{ "url": "https://www.tiktok.com/...", "format": "mp3" }`
+- Body: `{ "url": "https://www.tiktok.com/...", "format": "mp4" }`
+- Body: `{ "url": "https://www.youtube.com/watch?v=...", "format": "mp3" }`
+- Body: `{ "url": "https://www.youtube.com/watch?v=...", "format": "mp4" }`
+
+### GET /api/download?source=...&title=...
+Télécharge l'audio (mp3) correspondant au `source` renvoyé par `/api/convert`.

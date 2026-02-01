@@ -1,6 +1,6 @@
-# TikTok MP3 - Monorepo
+# TikTok / YouTube MP3 - Monorepo
 
-Application web pour convertir rapidement une video TikTok publique en MP3 et la telecharger depuis un iPhone.
+Application web pour convertir rapidement une vidéo TikTok ou YouTube publique en MP3 (audio) ou MP4 (vidéo) et la télécharger.
 
 ## Structure du projet
 
@@ -18,6 +18,9 @@ TiktokMp3/
 
 - Node.js >= 18
 - pnpm >= 8
+- FFmpeg (requis pour la conversion YouTube → MP3/MP4)
+
+Note pnpm : certains environnements bloquent les scripts d'installation. Si `ffmpeg-static` est installé sans binaire, lancez `pnpm approve-builds` et autorisez `ffmpeg-static`, ou installez FFmpeg sur votre machine et définissez `FFMPEG_PATH`.
 
 ## Installation locale
 
@@ -38,28 +41,26 @@ pnpm install
 
 ## Deploiement Docker
 
-Deux images sont fournies :
-- `packages/backend/Dockerfile` : serveur Express qui interroge TikTok et streame l'audio.
-- `packages/frontend/Dockerfile` : build Vite puis diffusion statique via Nginx.
-
-Le `docker-compose.yml` assemble ces images et suppose un reseau externe `caddy_net` (utile pour Caddy ou un reverse proxy).
+Trois services sont fournis :
+- `tiktokmp3-backend` : serveur Express (TikTok/YouTube) qui streame l'audio/vidéo.
+- `tiktokmp3-frontend` : build Vite puis diffusion statique via Nginx.
+- `tiktokmp3-caddy` : reverse proxy (sert le frontend et route `/api/*` vers le backend).
 
 ### Preparation
-
-```bash
-# creer le reseau une seule fois (si besoin)
-docker network create caddy_net
-```
 
 Optionnel : definir un fichier `.env` a la racine pour surcharger les variables (valeurs par defaut ci-dessous) :
 
 ```
 PORT=3000
-FRONTEND_ORIGIN=http://frontend.localhost
-VITE_API_BASE_URL=http://backend:3000
+FRONTEND_ORIGIN=http://localhost:8080
+VITE_API_BASE_URL=http://localhost:8080
 TIKTOK_METADATA_ENDPOINT=https://www.tikwm.com/api/
 API_TIMEOUT_MS=15000
 AUDIO_TIMEOUT_MS=30000
+FFMPEG_PATH=
+YOUTUBE_AUDIO_BITRATE=192k
+YOUTUBE_PROVIDER=yt-dlp
+YTDLP_TIMEOUT_MS=45000
 ```
 
 ### Build et lancement
@@ -68,11 +69,7 @@ AUDIO_TIMEOUT_MS=30000
 docker compose up --build
 ```
 
-Les services ne publient pas de ports directement. Assurez-vous que votre reverse proxy sur `caddy_net` redirige vers :
-- `backend:3000` pour l'API
-- `frontend:80` pour l'interface web (servie par Nginx)
-
-Le build frontend injecte l'URL de l'API via l'argument `VITE_API_BASE_URL`. Ajustez-le si l'API est exposee sur une adresse differente.
+Puis ouvrez `http://localhost:8080`. Caddy sert le frontend et reverse-proxy l'API.
 
 ## Documentation additionnelle
 

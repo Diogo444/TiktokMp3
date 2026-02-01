@@ -2,12 +2,13 @@
 import { computed, onBeforeUnmount, ref } from 'vue';
 
 const formUrl = ref('');
+const outputFormat = ref('mp3'); // mp3 | mp4
 const statusMessage = ref('');
 const statusTone = ref('idle'); // idle | loading | success | error
 const isSubmitting = ref(false);
 const isDownloading = ref(false);
 const result = ref(null);
-const audioObjectUrl = ref('');
+const mediaObjectUrl = ref('');
 const downloadError = ref('');
 
 const IOS_USER_AGENT_MATCH =
@@ -21,10 +22,39 @@ const resetStatus = () => {
   downloadError.value = '';
 };
 
+// Messages d'erreur détaillés par type
+const ERROR_MESSAGES = {
+  network: 'Problème de connexion réseau. Vérifiez votre connexion internet et réessayez.',
+  timeout: 'La requête a pris trop de temps. Le serveur est peut-être surchargé, réessayez dans quelques instants.',
+  invalidUrl: 'Le lien fourni n\'est pas valide. Assurez-vous de copier l\'URL complète depuis TikTok ou YouTube.',
+  serverError: 'Le serveur a rencontré un problème. Réessayez dans quelques secondes.',
+  videoUnavailable: 'Cette vidéo n\'est pas accessible. Elle est peut-être privée ou supprimée.',
+  default: 'Une erreur inattendue est survenue. Merci de réessayer.',
+};
+
+const getErrorMessage = (error, context = 'default') => {
+  if (!error) return ERROR_MESSAGES.default;
+  
+  const message = error?.message?.toLowerCase() || '';
+  
+  if (message.includes('network') || message.includes('fetch')) {
+    return ERROR_MESSAGES.network;
+  }
+  if (message.includes('timeout') || message.includes('abort')) {
+    return ERROR_MESSAGES.timeout;
+  }
+  if (message.includes('private') || message.includes('unavailable') || message.includes('not found')) {
+    return ERROR_MESSAGES.videoUnavailable;
+  }
+  
+  // Retourner le message du serveur s'il existe, sinon le message par défaut
+  return error?.message || ERROR_MESSAGES[context] || ERROR_MESSAGES.default;
+};
+
 const revokeAudioUrl = () => {
-  if (audioObjectUrl.value) {
-    URL.revokeObjectURL(audioObjectUrl.value);
-    audioObjectUrl.value = '';
+  if (mediaObjectUrl.value) {
+    URL.revokeObjectURL(mediaObjectUrl.value);
+    mediaObjectUrl.value = '';
   }
 };
 
@@ -51,6 +81,9 @@ const toAbsoluteUrl = (pathOrUrl) => {
 
 const hasUrlValue = computed(() => formUrl.value.trim().length > 0);
 const submitDisabled = computed(() => !hasUrlValue.value || isSubmitting.value);
+const submitLabel = computed(() =>
+  outputFormat.value === 'mp4' ? 'Convertir en MP4' : 'Convertir en MP3',
+);
 
 const statusClass = computed(() => ({
   'status-message': true,
@@ -74,15 +107,30 @@ const prettyDuration = computed(() => {
   return `${minutes}min ${remainingSeconds.toString().padStart(2, '0')}s`;
 });
 
-const validateUrl = (value) => {
+const detectPlatform = (value) => {
   try {
     const candidate = new URL(value);
-    return (
-      ['https:', 'http:'].includes(candidate.protocol) &&
-      candidate.hostname.includes('tiktok')
-    );
+    if (!['https:', 'http:'].includes(candidate.protocol)) {
+      return null;
+    }
+
+    const host = candidate.hostname.toLowerCase();
+    if (host.includes('tiktok')) {
+      return 'tiktok';
+    }
+    if (
+      host === 'youtu.be' ||
+      host.endsWith('.youtu.be') ||
+      host === 'youtube.com' ||
+      host.endsWith('.youtube.com') ||
+      host === 'music.youtube.com' ||
+      host.endsWith('.music.youtube.com')
+    ) {
+      return 'youtube';
+    }
+    return null;
   } catch (error) {
-    return false;
+    return null;
   }
 };
 
@@ -91,20 +139,23 @@ const handleSubmit = async () => {
 
   const trimmedUrl = formUrl.value.trim();
   if (!trimmedUrl) {
-    statusMessage.value = 'Merci de coller un lien TikTok valide.';
+    statusMessage.value = 'Merci de coller un lien TikTok ou YouTube valide.';
     statusTone.value = 'error';
     return;
   }
 
-  if (!validateUrl(trimmedUrl)) {
+  const platform = detectPlatform(trimmedUrl);
+  if (!platform) {
     statusMessage.value =
-      "Le lien ne ressemble pas à une URL TikTok. Vérifiez qu'il commence par https://www.tiktok.com/ ...";
+      "Le lien ne ressemble pas à une URL TikTok ou YouTube. Vérifiez qu'il commence par https://www.tiktok.com/ ou https://www.youtube.com/ ...";
     statusTone.value = 'error';
     return;
   }
 
   isSubmitting.value = true;
-  statusMessage.value = 'Conversion en cours, patientez quelques secondes…';
+  const formatLabel = outputFormat.value === 'mp4' ? 'vidéo MP4' : 'audio MP3';
+  const platformLabel = platform === 'youtube' ? 'YouTube' : 'TikTok';
+  statusMessage.value = `⏳ Récupération de la ${formatLabel} depuis ${platformLabel}... Cela peut prendre quelques secondes.`;
   statusTone.value = 'loading';
   downloadError.value = '';
 
@@ -114,7 +165,7 @@ const handleSubmit = async () => {
       headers: {
         'content-type': 'application/json',
       },
-      body: JSON.stringify({ url: trimmedUrl }),
+      body: JSON.stringify({ url: trimmedUrl, format: outputFormat.value }),
     });
 
     if (!response.ok) {
@@ -126,7 +177,7 @@ const handleSubmit = async () => {
     }
 
     const payload = await response.json();
-    const audio = payload?.audio;
+    const audio = payload?.audio || payload?.media;
 
     if (!audio?.downloadPath) {
       throw new Error(
@@ -136,23 +187,25 @@ const handleSubmit = async () => {
 
     revokeAudioUrl();
     result.value = {
+      format: audio.format || outputFormat.value || 'mp3',
       title: audio.title,
       author: audio.author,
       cover: audio.cover,
       duration: audio.duration,
-      fileName: audio.fileName || 'tiktok-audio.mp3',
+      fileName:
+        audio.fileName ||
+        (outputFormat.value === 'mp4' ? 'media.mp4' : 'audio.mp3'),
       downloadUrl: toAbsoluteUrl(audio.downloadPath),
     };
 
-    statusMessage.value =
-      'Conversion réussie ! Vous pouvez maintenant télécharger votre MP3.';
+    const successFormat = result.value.format === 'mp4' ? 'MP4' : 'MP3';
+    const duration = prettyDuration.value ? ` (${prettyDuration.value})` : '';
+    statusMessage.value = `✅ Conversion réussie ! Votre ${successFormat}${duration} est prêt à être téléchargé.`;
     statusTone.value = 'success';
   } catch (error) {
     console.error('Conversion front error:', error);
     result.value = null;
-    statusMessage.value =
-      error?.message ||
-      'Une erreur inattendue est survenue. Merci de réessayer.';
+    statusMessage.value = `❌ ${getErrorMessage(error, 'serverError')}`;
     statusTone.value = 'error';
   } finally {
     isSubmitting.value = false;
@@ -166,12 +219,19 @@ const downloadAudio = async () => {
 
   isDownloading.value = true;
   downloadError.value = '';
+  const formatLabel = result.value.format === 'mp4' ? 'MP4' : 'MP3';
+  statusMessage.value = `⬇️ Téléchargement du ${formatLabel} en cours...`;
+  statusTone.value = 'loading';
 
   try {
     const response = await fetch(result.value.downloadUrl);
     if (!response.ok) {
+      const errorPayload = await response.json().catch(() => null);
+      const message =
+        errorPayload?.error ||
+        'Impossible de récupérer le fichier audio. Tentez une nouvelle fois.';
       throw new Error(
-        'Impossible de récupérer le fichier audio. Tentez une nouvelle fois.',
+        message,
       );
     }
 
@@ -182,17 +242,21 @@ const downloadAudio = async () => {
       );
     }
 
-    // Forcer le type MIME à audio/mpeg pour éviter .mp3.mp4
-    const mp3Blob = new Blob([blob], { type: 'audio/mpeg' });
+    const isMp4 = result.value.format === 'mp4';
+    const mimeType = isMp4 ? 'video/mp4' : 'audio/mpeg';
+
+    // Forcer le type MIME pour éviter des extensions incorrectes côté navigateur
+    const fileBlob = new Blob([blob], { type: mimeType });
 
     revokeAudioUrl();
-    const objectUrl = URL.createObjectURL(mp3Blob);
-    audioObjectUrl.value = objectUrl;
+    const objectUrl = URL.createObjectURL(fileBlob);
+    mediaObjectUrl.value = objectUrl;
 
     if (isIOS.value) {
       window.open(objectUrl, '_blank', 'noopener');
-      statusMessage.value =
-        'Le MP3 est prêt. Dans Safari, touchez le bouton partager puis “Enregistrer dans Fichiers”.';
+      statusMessage.value = isMp4
+        ? '✅ Le MP4 est prêt ! Dans Safari, touchez "Partager" → "Enregistrer dans Fichiers".'
+        : '✅ Le MP3 est prêt ! Dans Safari, touchez "Partager" → "Enregistrer dans Fichiers".';
       statusTone.value = 'success';
     } else {
       const anchor = document.createElement('a');
@@ -203,15 +267,15 @@ const downloadAudio = async () => {
       document.body.appendChild(anchor);
       anchor.click();
       document.body.removeChild(anchor);
-      statusMessage.value = 'Le MP3 a été téléchargé avec succès.';
+      const fileFormat = result.value.format === 'mp4' ? 'MP4' : 'MP3';
+      statusMessage.value = `✅ ${fileFormat} téléchargé avec succès ! Vérifiez votre dossier de téléchargements.`;
       statusTone.value = 'success';
     }
   } catch (error) {
     console.error('Download front error:', error);
-    downloadError.value =
-      error?.message ||
-      'Le téléchargement a échoué. Vérifiez votre connexion et réessayez.';
-    statusMessage.value = downloadError.value;
+    const errorMsg = getErrorMessage(error, 'network');
+    downloadError.value = errorMsg;
+    statusMessage.value = `❌ ${errorMsg}`;
     statusTone.value = 'error';
   } finally {
     isDownloading.value = false;
@@ -223,17 +287,17 @@ const downloadAudio = async () => {
   <main class="layout">
     <section class="panel">
       <header class="panel__header">
-        <h1 class="panel__title">TikTok → MP3</h1>
+        <h1 class="panel__title">TikTok / YouTube → MP3 / MP4</h1>
         <p class="panel__subtitle">
-          Collez n'importe quel lien TikTok public et obtenez un fichier audio
-          prêt à être sauvegardé sur votre iPhone.
+          Collez un lien TikTok ou YouTube public et obtenez un fichier audio
+          ou vidéo prêt à être sauvegardé sur votre téléphone.
         </p>
       </header>
 
       <form class="panel__form" @submit.prevent="handleSubmit">
         <div class="field-group">
           <label class="field-group__label" for="tiktok-url">
-            Adresse de la vidéo TikTok
+            Adresse de la vidéo TikTok ou YouTube
           </label>
           <div class="field-group__controls">
             <input
@@ -245,7 +309,7 @@ const downloadAudio = async () => {
               inputmode="url"
               autocomplete="url"
               spellcheck="false"
-              placeholder="https://www.tiktok.com/@username/video/..."
+              placeholder="https://www.tiktok.com/@username/video/... ou https://www.youtube.com/watch?v=..."
               class="field-group__input"
               :aria-invalid="statusTone === 'error'"
               aria-describedby="url-hint"
@@ -256,11 +320,31 @@ const downloadAudio = async () => {
               :disabled="submitDisabled"
             >
               <span v-if="isSubmitting" class="spinner" aria-hidden="true" />
-              <span>{{ isSubmitting ? 'Conversion…' : 'Convertir en MP3' }}</span>
+              <span>{{ isSubmitting ? 'Conversion…' : submitLabel }}</span>
+            </button>
+          </div>
+          <div class="format-toggle" role="group" aria-label="Choisir le format">
+            <button
+              class="format-toggle__button"
+              type="button"
+              :aria-pressed="outputFormat === 'mp3'"
+              :data-active="outputFormat === 'mp3'"
+              @click="outputFormat = 'mp3'"
+            >
+              MP3 (audio)
+            </button>
+            <button
+              class="format-toggle__button"
+              type="button"
+              :aria-pressed="outputFormat === 'mp4'"
+              :data-active="outputFormat === 'mp4'"
+              @click="outputFormat = 'mp4'"
+            >
+              MP4 (vidéo)
             </button>
           </div>
           <p id="url-hint" class="field-group__hint">
-            Astuce : ouvrez TikTok, touchez “Partager” puis “Copier le lien”.
+            Astuce : ouvrez TikTok/YouTube, touchez “Partager” puis “Copier le lien”.
           </p>
         </div>
       </form>
@@ -304,7 +388,13 @@ const downloadAudio = async () => {
             >
               <span v-if="isDownloading" class="spinner" aria-hidden="true" />
               <span>
-                {{ isDownloading ? 'Préparation…' : 'Télécharger le MP3' }}
+                {{
+                  isDownloading
+                    ? 'Préparation…'
+                    : result?.format === 'mp4'
+                      ? 'Télécharger le MP4'
+                      : 'Télécharger le MP3'
+                }}
               </span>
             </button>
             <a
@@ -318,12 +408,20 @@ const downloadAudio = async () => {
             </a>
           </div>
 
-          <div v-if="audioObjectUrl" class="result-card__player">
+          <div v-if="mediaObjectUrl && result?.format === 'mp3'" class="result-card__player">
             <audio
-              :src="audioObjectUrl"
+              :src="mediaObjectUrl"
               controls
               preload="metadata"
-              aria-label="Préécoute du MP3 TikTok converti"
+              aria-label="Préécoute du MP3 converti"
+            />
+          </div>
+          <div v-if="mediaObjectUrl && result?.format === 'mp4'" class="result-card__player">
+            <video
+              :src="mediaObjectUrl"
+              controls
+              preload="metadata"
+              aria-label="Préécoute du MP4 converti"
             />
           </div>
 

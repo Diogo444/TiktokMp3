@@ -1,9 +1,14 @@
 import crypto from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
 
+import ytdl from '@distube/ytdl-core';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
+import ffmpegStaticPath from 'ffmpeg-static';
 
 dotenv.config();
 
@@ -13,12 +18,43 @@ const TIKTOK_METADATA_ENDPOINT =
   process.env.TIKTOK_METADATA_ENDPOINT || 'https://www.tikwm.com/api/';
 
 const API_RESPONSE_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS ?? 15000);
+const SUPPORTED_FORMATS = new Set(['mp3', 'mp4']);
+
+// Messages d'erreur centralisés pour cohérence
+const ERROR_MESSAGES = {
+  urlRequired: 'Une URL TikTok ou YouTube est requise.',
+  invalidFormat: 'Format invalide. Seuls MP3 et MP4 sont supportés.',
+  invalidUrl: "L'URL fournie n'est pas reconnue comme TikTok ou YouTube. Vérifiez le lien et réessayez.",
+  tiktokMetadataFailed: 'Impossible de récupérer les informations TikTok. Le service est peut-être temporairement indisponible.',
+  tiktokVideoPrivate: 'Cette vidéo TikTok semble privée ou supprimée. Vérifiez qu\'elle est accessible publiquement.',
+  tiktokAudioNotFound: 'Impossible d\'extraire l\'audio de cette vidéo TikTok.',
+  tiktokVideoNotFound: 'Impossible d\'extraire la vidéo TikTok.',
+  youtubeIdInvalid: 'Impossible d\'identifier la vidéo YouTube. Vérifiez le lien (formats acceptés: watch?v=..., youtu.be/..., shorts/...).',
+  youtubeMetadataFailed: 'Impossible de récupérer les informations YouTube. Réessayez dans quelques instants.',
+  youtubeStreamFailed: 'Impossible de récupérer les flux audio/vidéo YouTube.',
+  ffmpegMissing: 'Le convertisseur audio (FFmpeg) n\'est pas disponible sur le serveur. Contactez l\'administrateur.',
+  downloadTimeout: 'Le téléchargement a pris trop de temps. Réessayez dans quelques instants.',
+  downloadFailed: 'Échec du téléchargement. Le service est peut-être surchargé.',
+  serverError: 'Une erreur inattendue est survenue. Merci de réessayer.',
+  sourceInvalid: 'Le lien de téléchargement est invalide ou expiré. Relancez la conversion.',
+};
 
 // Middleware
 app.use(cors());
 app.options('*', cors());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Middleware pour ajouter des headers de performance
+app.use((req, res, next) => {
+  // Ajouter le timing de la requête
+  req.startTime = Date.now();
+  
+  // Headers de cache pour les APIs
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  
+  next();
+});
 
 const sanitizeFilename = (value = '') =>
   value
@@ -40,11 +76,221 @@ const isTikTokUrl = (value = '') => {
   }
 };
 
-const encodeSource = (value) =>
-  Buffer.from(value, 'utf-8').toString('base64url');
+const isYouTubeUrl = (value = '') => {
+  try {
+    const { hostname, protocol } = new URL(value);
+    if (!['http:', 'https:'].includes(protocol)) {
+      return false;
+    }
+    const host = hostname.toLowerCase();
+    return (
+      host === 'youtu.be' ||
+      host.endsWith('.youtu.be') ||
+      host === 'youtube.com' ||
+      host.endsWith('.youtube.com') ||
+      host === 'music.youtube.com' ||
+      host.endsWith('.music.youtube.com')
+    );
+  } catch (error) {
+    return false;
+  }
+};
 
-const decodeSource = (value) =>
-  Buffer.from(value, 'base64url').toString('utf-8');
+const extractYouTubeVideoId = (value = '') => {
+  try {
+    const candidate = new URL(value);
+    const host = candidate.hostname.toLowerCase();
+
+    let id = null;
+    if (host === 'youtu.be' || host.endsWith('.youtu.be')) {
+      id = candidate.pathname.replace(/^\/+/, '').split('/')[0] || null;
+    } else {
+      id = candidate.searchParams.get('v');
+      if (!id) {
+        const path = candidate.pathname.replace(/^\/+/, '');
+        const segments = path.split('/');
+        const kind = segments[0];
+        if (kind === 'shorts' || kind === 'embed' || kind === 'live') {
+          id = segments[1] || null;
+        }
+      }
+    }
+
+    if (!id) {
+      return null;
+    }
+    const trimmed = id.trim();
+    return /^[a-zA-Z0-9_-]{11}$/.test(trimmed) ? trimmed : null;
+  } catch (error) {
+    return null;
+  }
+};
+
+const detectPlatform = (value = '') => {
+  if (isTikTokUrl(value)) {
+    return 'tiktok';
+  }
+  if (isYouTubeUrl(value)) {
+    return 'youtube';
+  }
+  return null;
+};
+
+const encodeSource = (value) =>
+  Buffer.from(JSON.stringify(value), 'utf-8').toString('base64url');
+
+const decodeSource = (value) => {
+  const decoded = Buffer.from(value, 'base64url').toString('utf-8');
+  try {
+    return JSON.parse(decoded);
+  } catch (error) {
+    return { platform: 'tiktok', url: decoded };
+  }
+};
+
+const resolveFfmpegPath = () => {
+  if (process.env.FFMPEG_PATH) {
+    return process.env.FFMPEG_PATH;
+  }
+
+  if (
+    typeof ffmpegStaticPath === 'string' &&
+    ffmpegStaticPath.length > 0 &&
+    existsSync(ffmpegStaticPath)
+  ) {
+    return ffmpegStaticPath;
+  }
+
+  return 'ffmpeg';
+};
+
+const isFfmpegAvailable = (ffmpegPath) => {
+  if (!ffmpegPath || typeof ffmpegPath !== 'string') {
+    return false;
+  }
+
+  const isLikelyPath =
+    ffmpegPath.includes('/') ||
+    ffmpegPath.includes('\\') ||
+    ffmpegPath.toLowerCase().endsWith('.exe');
+
+  if (isLikelyPath && !existsSync(ffmpegPath)) {
+    return false;
+  }
+
+  const check = spawnSync(ffmpegPath, ['-version'], { stdio: 'ignore' });
+  return !check.error && check.status === 0;
+};
+
+const isCommandAvailable = (command) => {
+  try {
+    const check = spawnSync(command, ['--version'], { stdio: 'ignore' });
+    return !check.error && check.status === 0;
+  } catch {
+    return false;
+  }
+};
+
+const YOUTUBE_PROVIDER = (() => {
+  const configured = (process.env.YOUTUBE_PROVIDER || '').trim().toLowerCase();
+  if (configured) {
+    return configured;
+  }
+  return isCommandAvailable('yt-dlp') ? 'yt-dlp' : 'ytdl';
+})();
+
+const runCommand = async (command, args, options = {}) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      ...options,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+
+    const timeoutMs = Number(options.timeoutMs ?? 30000);
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            child.kill('SIGKILL');
+            reject(new Error(`${command} timed out after ${timeoutMs}ms`));
+          }, timeoutMs)
+        : null;
+
+    child.stdout.on('data', (chunk) => stdoutChunks.push(chunk));
+    child.stderr.on('data', (chunk) => stderrChunks.push(chunk));
+
+    child.on('error', (error) => {
+      if (timer) clearTimeout(timer);
+      reject(error);
+    });
+
+    child.on('close', (code) => {
+      if (timer) clearTimeout(timer);
+      const stdout = Buffer.concat(stdoutChunks).toString('utf-8');
+      const stderr = Buffer.concat(stderrChunks).toString('utf-8');
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        const error = new Error(
+          `${command} exited with code ${code}${stderr ? `: ${stderr}` : ''}`,
+        );
+        error.code = code;
+        error.stderr = stderr;
+        reject(error);
+      }
+    });
+  });
+
+const toFfmpegHeadersValue = (headers = {}) => {
+  const pairs = Object.entries(headers)
+    .filter(([key, value]) => key && typeof value === 'string' && value.trim())
+    .map(([key, value]) => `${key}: ${value.replace(/[\r\n]+/g, ' ').trim()}\r\n`);
+  return pairs.join('');
+};
+
+const getYtDlpInfo = async (videoUrl, requestedFormat) => {
+  const formatSelector =
+    requestedFormat === 'mp4'
+      ? 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
+      : 'ba[ext=m4a]/ba/b';
+
+  const { stdout, stderr } = await runCommand(
+    'yt-dlp',
+    ['-J', '--no-playlist', '--skip-download', '-f', formatSelector, videoUrl],
+    { timeoutMs: Number(process.env.YTDLP_TIMEOUT_MS ?? 45000) },
+  );
+
+  if (stderr?.trim()) {
+    console.error('yt-dlp stderr:', stderr.trim());
+  }
+
+  try {
+    return JSON.parse(stdout);
+  } catch (error) {
+    console.error('yt-dlp JSON parse error:', error);
+    throw new Error('yt-dlp did not return valid JSON');
+  }
+};
+
+const normalizeYtDlpInputs = (payload, fallbackHeaders) => {
+  const topHeaders = payload?.http_headers || payload?.headers || fallbackHeaders || {};
+  const formats = payload?.requested_formats?.length
+    ? payload.requested_formats
+    : payload?.url
+      ? [payload]
+      : [];
+
+  return formats
+    .map((fmt) => ({
+      url: fmt?.url,
+      headers: fmt?.http_headers || fmt?.headers || topHeaders,
+      vcodec: (fmt?.vcodec || '').toString(),
+      acodec: (fmt?.acodec || '').toString(),
+    }))
+    .filter((entry) => typeof entry.url === 'string' && entry.url.length > 0);
+};
 
 const fetchWithTimeout = async (url, options = {}) => {
   const controller = new AbortController();
@@ -66,7 +312,7 @@ const fetchWithTimeout = async (url, options = {}) => {
 
 // Routes
 app.get('/', (req, res) => {
-  res.json({ message: 'TikTok MP3 API is running' });
+  res.json({ message: 'TikTok / YouTube MP3 API is running' });
 });
 
 app.get('/api/health', (req, res) => {
@@ -74,97 +320,217 @@ app.get('/api/health', (req, res) => {
 });
 
 app.post('/api/convert', async (req, res) => {
+  const startTime = Date.now();
   try {
-    const { url } = req.body;
+    const { url, format: rawFormat } = req.body;
 
     if (!url) {
-      return res.status(400).json({ error: 'Une URL TikTok est requise.' });
+      return res
+        .status(400)
+        .json({ error: ERROR_MESSAGES.urlRequired, code: 'URL_REQUIRED' });
     }
 
-    if (!isTikTokUrl(url)) {
+    const format = (rawFormat || 'mp3').toString().trim().toLowerCase();
+    if (!SUPPORTED_FORMATS.has(format)) {
       return res.status(400).json({
-        error:
-          "L'URL fournie ne semble pas provenir de TikTok. Merci de vérifier le lien.",
+        error: ERROR_MESSAGES.invalidFormat,
+        code: 'INVALID_FORMAT',
       });
     }
 
-    const upstreamResponse = await fetchWithTimeout(
-      TIKTOK_METADATA_ENDPOINT,
-      {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    const platform = detectPlatform(url);
+    if (!platform) {
+      return res.status(400).json({
+        error: ERROR_MESSAGES.invalidUrl,
+        code: 'INVALID_URL',
+      });
+    }
+
+    if (platform === 'tiktok') {
+      const upstreamResponse = await fetchWithTimeout(
+        TIKTOK_METADATA_ENDPOINT,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          },
+          body: new URLSearchParams({ url }),
         },
-        body: new URLSearchParams({ url }),
-      },
-    );
-
-    if (!upstreamResponse.ok) {
-      console.error(
-        'Metadata upstream error:',
-        upstreamResponse.status,
-        upstreamResponse.statusText,
       );
-      return res.status(502).json({
-        error:
-          "Impossible de récupérer les informations de la vidéo pour le moment.",
+
+      if (!upstreamResponse.ok) {
+        console.error(
+          'Metadata upstream error:',
+          upstreamResponse.status,
+          upstreamResponse.statusText,
+        );
+        return res.status(502).json({
+          error: ERROR_MESSAGES.tiktokMetadataFailed,
+          code: 'TIKTOK_METADATA_FAILED',
+        });
+      }
+
+      const payload = await upstreamResponse.json();
+
+      if (payload.code !== 0 || !payload.data) {
+        console.error('Unexpected upstream payload:', payload);
+        return res.status(400).json({
+          error: ERROR_MESSAGES.tiktokVideoPrivate,
+          code: 'TIKTOK_VIDEO_PRIVATE',
+        });
+      }
+
+      const { data } = payload;
+      const title =
+        data.title?.trim() ||
+        data.music_info?.title?.trim() ||
+        'TikTok Audio';
+      const author =
+        data.music_info?.author?.trim() ||
+        data.author?.nickname?.trim() ||
+        'Créateur TikTok';
+
+      const tiktokSourceUrl =
+        format === 'mp4'
+          ? data.hdplay || data.play || data.wmplay || data.video || null
+          : data.music || null;
+
+      if (!tiktokSourceUrl) {
+        return res.status(400).json({
+          error: format === 'mp4' ? ERROR_MESSAGES.tiktokVideoNotFound : ERROR_MESSAGES.tiktokAudioNotFound,
+          code: format === 'mp4' ? 'TIKTOK_VIDEO_NOT_FOUND' : 'TIKTOK_AUDIO_NOT_FOUND',
+        });
+      }
+
+      const safeTitle = sanitizeFilename(title);
+      const encodedSource = encodeSource({
+        platform: 'tiktok',
+        format,
+        url: tiktokSourceUrl,
       });
+
+      res.json({
+        success: true,
+        audio: {
+          platform,
+          format,
+          title,
+          author,
+          cover: data.cover,
+          duration: data.duration,
+          fileName: `${safeTitle}.${format}`,
+          downloadPath: `/api/download?source=${encodedSource}&title=${encodeURIComponent(
+            safeTitle,
+          )}`,
+        },
+        meta: {
+          id: data.id,
+          originalUrl: url,
+          thumbnail: data.cover,
+          videoDuration: data.duration,
+          processingTimeMs: Date.now() - startTime,
+        },
+      });
+      return;
     }
 
-    const payload = await upstreamResponse.json();
-
-    if (payload.code !== 0 || !payload.data?.music) {
-      console.error('Unexpected upstream payload:', payload);
+    const videoId = extractYouTubeVideoId(url);
+    if (!videoId) {
       return res.status(400).json({
-        error:
-          "La conversion n'a pas abouti. Vérifiez que la vidéo est publique et disponible.",
+        error: ERROR_MESSAGES.youtubeIdInvalid,
+        code: 'YOUTUBE_ID_INVALID',
       });
     }
 
-    const { data } = payload;
-    const title =
-      data.title?.trim() ||
-      data.music_info?.title?.trim() ||
-      'TikTok Audio';
-    const author =
-      data.music_info?.author?.trim() ||
-      data.author?.nickname?.trim() ||
-      'Créateur TikTok';
+    const youtubeWatchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+    let title = 'YouTube Audio';
+    let author = 'YouTube';
+    let duration = undefined;
+    let cover = undefined;
+
+    if (YOUTUBE_PROVIDER === 'yt-dlp' && isCommandAvailable('yt-dlp')) {
+      try {
+        const ytdlpPayload = await getYtDlpInfo(youtubeWatchUrl, format);
+        title = ytdlpPayload?.title?.trim?.() || title;
+        author =
+          ytdlpPayload?.uploader?.trim?.() ||
+          ytdlpPayload?.channel?.trim?.() ||
+          ytdlpPayload?.creator?.trim?.() ||
+          author;
+        duration =
+          typeof ytdlpPayload?.duration === 'number'
+            ? ytdlpPayload.duration
+            : duration;
+        cover =
+          ytdlpPayload?.thumbnail ||
+          ytdlpPayload?.thumbnails?.at(-1)?.url ||
+          ytdlpPayload?.thumbnails?.[0]?.url ||
+          cover;
+      } catch (error) {
+        console.error('yt-dlp metadata error:', error);
+      }
+    }
+
+    if (title === 'YouTube Audio') {
+      let info;
+      try {
+        info = await ytdl.getBasicInfo(youtubeWatchUrl);
+      } catch (error) {
+        console.error('YouTube metadata error:', error);
+        return res.status(502).json({
+          error: ERROR_MESSAGES.youtubeMetadataFailed,
+          code: 'YOUTUBE_METADATA_FAILED',
+        });
+      }
+
+      const details = info?.videoDetails;
+      title = details?.title?.trim() || title;
+      author =
+        details?.author?.name?.trim() ||
+        details?.ownerChannelName?.trim() ||
+        author;
+      duration = Number(details?.lengthSeconds ?? 0) || duration;
+      cover = details?.thumbnails?.at(-1)?.url || details?.thumbnails?.[0]?.url;
+    }
+
     const safeTitle = sanitizeFilename(title);
-    const encodedSource = encodeSource(data.music);
+    const encodedSource = encodeSource({ platform: 'youtube', format, id: videoId });
 
     res.json({
       success: true,
       audio: {
+        platform,
+        format,
         title,
         author,
-        cover: data.cover,
-        duration: data.duration,
-        fileName: `${safeTitle}.mp3`,
+        cover,
+        duration,
+        fileName: `${safeTitle}.${format}`,
         downloadPath: `/api/download?source=${encodedSource}&title=${encodeURIComponent(
           safeTitle,
         )}`,
       },
       meta: {
-        id: data.id,
+        id: videoId,
         originalUrl: url,
-        thumbnail: data.cover,
-        videoDuration: data.duration,
+        videoDuration: duration,
+        processingTimeMs: Date.now() - startTime,
       },
     });
   } catch (error) {
     if (error.name === 'AbortError') {
       console.error('Metadata upstream timeout:', error);
       return res.status(504).json({
-        error:
-          'La réponse TikTok est trop longue à arriver. Réessayez dans un instant.',
+        error: ERROR_MESSAGES.downloadTimeout,
+        code: 'TIMEOUT',
       });
     }
 
     console.error('Convert error:', error);
     res.status(500).json({
-      error:
-        "Une erreur inattendue est survenue pendant la conversion. Merci de réessayer.",
+      error: ERROR_MESSAGES.serverError,
+      code: 'SERVER_ERROR',
     });
   }
 });
@@ -174,19 +540,499 @@ app.get('/api/download', async (req, res) => {
     const { source, title } = req.query;
 
     if (!source) {
-      return res.status(400).json({ error: 'Paramètre source manquant.' });
+      return res.status(400).json({ error: ERROR_MESSAGES.sourceInvalid, code: 'SOURCE_MISSING' });
     }
 
-    let upstreamUrl;
+    let payload;
     try {
-      upstreamUrl = decodeSource(source);
+      payload = decodeSource(source);
     } catch (error) {
       return res
         .status(400)
-        .json({ error: 'Paramètre source invalide ou corrompu.' });
+        .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'SOURCE_INVALID' });
     }
 
     const safeTitle = sanitizeFilename(title);
+    const format = payload?.format === 'mp4' ? 'mp4' : 'mp3';
+
+    if (payload?.platform === 'youtube') {
+      const videoId = payload?.id;
+      if (!videoId || typeof videoId !== 'string') {
+        return res.status(400).json({
+          error: ERROR_MESSAGES.sourceInvalid,
+          code: 'YOUTUBE_SOURCE_INVALID',
+        });
+      }
+
+      const ffmpegPath = resolveFfmpegPath();
+      if (!isFfmpegAvailable(ffmpegPath)) {
+        return res.status(500).json({
+          error: ERROR_MESSAGES.ffmpegMissing,
+          code: 'FFMPEG_MISSING',
+        });
+      }
+      const inputUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+      if (YOUTUBE_PROVIDER === 'yt-dlp' && isCommandAvailable('yt-dlp')) {
+        let ytdlpPayload;
+        try {
+          ytdlpPayload = await getYtDlpInfo(inputUrl, format);
+        } catch (error) {
+          console.error('yt-dlp info error:', error);
+          return res.status(502).json({
+            error: ERROR_MESSAGES.youtubeStreamFailed,
+            code: 'YOUTUBE_STREAM_FAILED',
+          });
+        }
+
+        const inputs = normalizeYtDlpInputs(ytdlpPayload);
+        if (inputs.length === 0) {
+          return res.status(502).json({
+            error: ERROR_MESSAGES.youtubeStreamFailed,
+            code: 'YOUTUBE_STREAM_EMPTY',
+          });
+        }
+
+        const audioBitrate = process.env.YOUTUBE_AUDIO_BITRATE || '192k';
+        const ffmpegArgs = ['-hide_banner', '-loglevel', 'error'];
+
+        if (format === 'mp4') {
+          const videoInput =
+            inputs.find((entry) => entry.vcodec && entry.vcodec !== 'none') ||
+            inputs[0];
+          const audioInput =
+            inputs.find((entry) => entry.acodec && entry.acodec !== 'none' && entry.vcodec === 'none') ||
+            inputs.find((entry) => entry.acodec && entry.acodec !== 'none') ||
+            null;
+
+          const selectedInputs = audioInput && audioInput !== videoInput ? [videoInput, audioInput] : [videoInput];
+
+          for (const selected of selectedInputs) {
+            const headersValue = toFfmpegHeadersValue(selected.headers);
+            if (headersValue) {
+              ffmpegArgs.push('-headers', headersValue);
+            }
+            ffmpegArgs.push('-i', selected.url);
+          }
+
+          const videoCodec = (videoInput?.vcodec || '').toLowerCase();
+          const audioCodec = (audioInput?.acodec || '').toLowerCase();
+          const isH264 = videoCodec.includes('avc1') || videoCodec.includes('h264');
+          const isAac = audioCodec.includes('mp4a') || audioCodec.includes('aac');
+
+          const videoArgs = isH264
+            ? ['-c:v', 'copy']
+            : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'];
+          const audioArgs = audioInput
+            ? isAac
+              ? ['-c:a', 'copy']
+              : ['-c:a', 'aac', '-b:a', audioBitrate]
+            : ['-an'];
+
+          if (audioInput && selectedInputs.length === 2) {
+            ffmpegArgs.push('-map', '0:v:0', '-map', '1:a:0');
+          }
+
+          ffmpegArgs.push(
+            ...videoArgs,
+            ...audioArgs,
+            '-shortest',
+            '-f',
+            'mp4',
+            '-movflags',
+            'frag_keyframe+empty_moov',
+            'pipe:1',
+          );
+
+          const ffmpeg = spawn(ffmpegPath, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+          res.setHeader('Content-Type', 'video/mp4');
+          res.setHeader(
+            'Content-Disposition',
+            `attachment; filename="${safeTitle}.mp4"`,
+          );
+          res.setHeader('Cache-Control', 'no-store');
+
+          ffmpeg.stderr.on('data', (chunk) => {
+            const message = chunk?.toString?.() || '';
+            if (message.trim()) {
+              console.error('ffmpeg stderr:', message.trim());
+            }
+          });
+
+          ffmpeg.on('error', (error) => {
+            console.error('ffmpeg spawn error:', error);
+            res.destroy(error);
+          });
+
+          res.on('close', () => {
+            if (!res.writableEnded) {
+              try {
+                ffmpeg.kill('SIGKILL');
+              } catch {
+                // ignore
+              }
+            }
+          });
+
+          const outputPipeline = pipeline(ffmpeg.stdout, res);
+          const ffmpegExit = new Promise((resolve, reject) => {
+            ffmpeg.on('close', (code) => {
+              if (code === 0) {
+                resolve();
+              } else {
+                reject(new Error(`ffmpeg exited with code ${code}`));
+              }
+            });
+          });
+
+          await Promise.all([outputPipeline, ffmpegExit]).catch((error) => {
+            console.error('YouTube MP4 (yt-dlp) error:', error);
+            if (!res.headersSent) {
+              res.status(502).json({
+                error: 'La conversion vidéo YouTube a échoué. La vidéo est peut-être protégée ou trop longue.',
+                code: 'YOUTUBE_MP4_FAILED',
+              });
+            } else {
+              res.destroy(error);
+            }
+          });
+
+          return;
+        }
+
+        const audioInput =
+          inputs.find((entry) => entry.acodec && entry.acodec !== 'none') || inputs[0];
+
+        const headersValue = toFfmpegHeadersValue(audioInput.headers);
+        if (headersValue) {
+          ffmpegArgs.push('-headers', headersValue);
+        }
+
+        ffmpegArgs.push(
+          '-i',
+          audioInput.url,
+          '-vn',
+          '-acodec',
+          'libmp3lame',
+          '-b:a',
+          audioBitrate,
+          '-f',
+          'mp3',
+          'pipe:1',
+        );
+
+        const ffmpeg = spawn(ffmpegPath, ffmpegArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${safeTitle}.mp3"`,
+        );
+        res.setHeader('Cache-Control', 'no-store');
+
+        ffmpeg.stderr.on('data', (chunk) => {
+          const message = chunk?.toString?.() || '';
+          if (message.trim()) {
+            console.error('ffmpeg stderr:', message.trim());
+          }
+        });
+
+        ffmpeg.on('error', (error) => {
+          console.error('ffmpeg spawn error:', error);
+          res.destroy(error);
+        });
+
+        res.on('close', () => {
+          if (!res.writableEnded) {
+            try {
+              ffmpeg.kill('SIGKILL');
+            } catch {
+              // ignore
+            }
+          }
+        });
+
+        const outputPipeline = pipeline(ffmpeg.stdout, res);
+        const ffmpegExit = new Promise((resolve, reject) => {
+          ffmpeg.on('close', (code) => {
+            if (code === 0) {
+              resolve();
+            } else {
+              reject(new Error(`ffmpeg exited with code ${code}`));
+            }
+          });
+        });
+
+        await Promise.all([outputPipeline, ffmpegExit]).catch((error) => {
+          console.error('YouTube MP3 (yt-dlp) error:', error);
+          if (!res.headersSent) {
+            res.status(502).json({
+              error: 'La conversion audio YouTube a échoué. Réessayez dans quelques instants.',
+              code: 'YOUTUBE_MP3_FAILED',
+            });
+          } else {
+            res.destroy(error);
+          }
+        });
+
+        return;
+      }
+
+      const closeOnAbort = (streams, child) => {
+        res.on('close', () => {
+          if (!res.writableEnded) {
+            for (const stream of streams) {
+              try {
+                stream?.destroy?.();
+              } catch {
+                // ignore
+              }
+            }
+            try {
+              child?.kill?.('SIGKILL');
+            } catch {
+              // ignore
+            }
+          }
+        });
+      };
+
+      const attachFfmpegDiagnostics = (ffmpeg) => {
+        ffmpeg.on('error', (error) => {
+          console.error('ffmpeg spawn error:', error);
+          if (!res.headersSent) {
+            res.status(500).json({
+              error: ERROR_MESSAGES.ffmpegMissing,
+              code: 'FFMPEG_ERROR',
+            });
+          } else {
+            res.destroy(error);
+          }
+        });
+
+        ffmpeg.stderr.on('data', (chunk) => {
+          const message = chunk?.toString?.() || '';
+          if (message.trim()) {
+            console.error('ffmpeg stderr:', message.trim());
+          }
+        });
+      };
+
+      if (format === 'mp4') {
+        const info = await ytdl.getInfo(inputUrl);
+        const formats = info?.formats || [];
+
+        const pickVideo =
+          formats
+            .filter((f) => f.hasVideo && !f.hasAudio && f.container === 'mp4')
+            .sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
+          formats
+            .filter((f) => f.hasVideo && !f.hasAudio)
+            .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+
+        const pickAudio =
+          formats
+            .filter(
+              (f) =>
+                f.hasAudio &&
+                !f.hasVideo &&
+                (f.container === 'mp4' || f.container === 'm4a'),
+            )
+            .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0] ||
+          formats
+            .filter((f) => f.hasAudio && !f.hasVideo)
+            .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+
+        if (!pickVideo || !pickAudio) {
+          return res.status(400).json({
+            error: ERROR_MESSAGES.youtubeStreamFailed,
+            code: 'YOUTUBE_STREAMS_NOT_FOUND',
+          });
+        }
+
+        const videoCodec = (pickVideo.videoCodec || pickVideo.codecs || '').toLowerCase();
+        const audioCodec = (pickAudio.audioCodec || pickAudio.codecs || '').toLowerCase();
+        const isH264 = videoCodec.includes('avc1') || videoCodec.includes('h264');
+        const isAac = audioCodec.includes('mp4a') || audioCodec.includes('aac');
+
+        const audioBitrate = process.env.YOUTUBE_AUDIO_BITRATE || '192k';
+        const videoArgs = isH264
+          ? ['-c:v', 'copy']
+          : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'];
+        const audioArgs = isAac
+          ? ['-c:a', 'copy']
+          : ['-c:a', 'aac', '-b:a', audioBitrate];
+
+        const ffmpeg = spawn(
+          ffmpegPath,
+          [
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-i',
+            'pipe:0',
+            '-i',
+            'pipe:3',
+            '-map',
+            '0:v:0',
+            '-map',
+            '1:a:0',
+            ...videoArgs,
+            ...audioArgs,
+            '-shortest',
+            '-f',
+            'mp4',
+            '-movflags',
+            'frag_keyframe+empty_moov',
+            'pipe:1',
+          ],
+          { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] },
+        );
+
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="${safeTitle}.mp4"`,
+        );
+        res.setHeader('Cache-Control', 'no-store');
+
+        attachFfmpegDiagnostics(ffmpeg);
+
+        const videoStream = ytdl.downloadFromInfo(info, {
+          format: pickVideo,
+          highWaterMark: 1 << 25,
+        });
+        const audioStream = ytdl.downloadFromInfo(info, {
+          format: pickAudio,
+          highWaterMark: 1 << 25,
+        });
+
+        videoStream.on('error', (error) => {
+          console.error('YouTube video stream error:', error);
+          res.destroy(error);
+        });
+        audioStream.on('error', (error) => {
+          console.error('YouTube audio stream error:', error);
+          res.destroy(error);
+        });
+
+        closeOnAbort([videoStream, audioStream], ffmpeg);
+
+        const inputVideo = pipeline(videoStream, ffmpeg.stdin);
+        const inputAudio = pipeline(audioStream, ffmpeg.stdio[3]);
+        const outputPipeline = pipeline(ffmpeg.stdout, res);
+        const ffmpegExit = new Promise((resolve, reject) => {
+          ffmpeg.on('close', (code) => {
+            if (code === 0) {
+              resolve();
+            } else {
+              reject(new Error(`ffmpeg exited with code ${code}`));
+            }
+          });
+        });
+
+        await Promise.all([inputVideo, inputAudio, outputPipeline, ffmpegExit]).catch(
+          (error) => {
+            if (error?.name === 'AbortError') {
+              return;
+            }
+            console.error('YouTube MP4 download error:', error);
+            if (!res.headersSent) {
+              res.status(500).json({
+                error: 'La conversion vidéo YouTube a échoué. Réessayez ou essayez une autre vidéo.',
+                code: 'YOUTUBE_MP4_DOWNLOAD_FAILED',
+              });
+            } else {
+              res.destroy(error);
+            }
+          },
+        );
+
+        return;
+      }
+
+      const youtubeStream = ytdl(inputUrl, {
+        filter: 'audioonly',
+        quality: 'highestaudio',
+        highWaterMark: 1 << 25,
+      });
+
+      const audioBitrate = process.env.YOUTUBE_AUDIO_BITRATE || '192k';
+      const ffmpeg = spawn(
+        ffmpegPath,
+        [
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-i',
+          'pipe:0',
+          '-vn',
+          '-acodec',
+          'libmp3lame',
+          '-b:a',
+          audioBitrate,
+          '-f',
+          'mp3',
+          'pipe:1',
+        ],
+        { stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+
+      res.setHeader('Content-Type', 'audio/mpeg');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${safeTitle}.mp3"`,
+      );
+      res.setHeader('Cache-Control', 'no-store');
+
+      attachFfmpegDiagnostics(ffmpeg);
+      closeOnAbort([youtubeStream], ffmpeg);
+
+      youtubeStream.on('error', (error) => {
+        console.error('YouTube stream error:', error);
+        res.destroy(error);
+      });
+
+      const inputPipeline = pipeline(youtubeStream, ffmpeg.stdin);
+      const outputPipeline = pipeline(ffmpeg.stdout, res);
+      const ffmpegExit = new Promise((resolve, reject) => {
+        ffmpeg.on('close', (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(`ffmpeg exited with code ${code}`));
+          }
+        });
+      });
+
+      await Promise.all([inputPipeline, outputPipeline, ffmpegExit]).catch(
+        (error) => {
+          if (error?.name === 'AbortError') {
+            return;
+          }
+          console.error('YouTube download error:', error);
+          if (!res.headersSent) {
+            res.status(500).json({
+              error: 'La conversion audio YouTube a échoué. Réessayez ou essayez une autre vidéo.',
+              code: 'YOUTUBE_DOWNLOAD_FAILED',
+            });
+          } else {
+            res.destroy(error);
+          }
+        },
+      );
+
+      return;
+    }
+
+    const upstreamUrl = payload?.url;
+    if (!upstreamUrl || typeof upstreamUrl !== 'string') {
+      return res.status(400).json({
+        error: ERROR_MESSAGES.sourceInvalid,
+        code: 'TIKTOK_SOURCE_INVALID',
+      });
+    }
 
     const upstreamResponse = await fetchWithTimeout(upstreamUrl, {
       timeout: Number(process.env.AUDIO_TIMEOUT_MS ?? 30000),
@@ -199,13 +1045,19 @@ app.get('/api/download', async (req, res) => {
         upstreamResponse.statusText,
       );
       return res.status(502).json({
-        error:
-          'Impossible de récupérer le flux audio. Veuillez réessayer plus tard.',
+        error: ERROR_MESSAGES.downloadFailed,
+        code: 'UPSTREAM_FAILED',
       });
     }
 
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeTitle}.mp3"`);
+    const contentType = format === 'mp4' ? 'video/mp4' : 'audio/mpeg';
+    const fileExt = format === 'mp4' ? 'mp4' : 'mp3';
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${safeTitle}.${fileExt}"`,
+    );
     res.setHeader('Cache-Control', 'no-store');
 
     await pipeline(upstreamResponse.body, res);
@@ -213,15 +1065,15 @@ app.get('/api/download', async (req, res) => {
     if (error.name === 'AbortError') {
       console.error('Audio upstream timeout:', error);
       return res.status(504).json({
-        error:
-          'TikTok met trop de temps à répondre. Veuillez réessayer dans quelques instants.',
+        error: ERROR_MESSAGES.downloadTimeout,
+        code: 'DOWNLOAD_TIMEOUT',
       });
     }
 
     console.error('Download error:', error);
     res
       .status(500)
-      .json({ error: 'Une erreur est survenue pendant le téléchargement.' });
+      .json({ error: ERROR_MESSAGES.serverError, code: 'DOWNLOAD_ERROR' });
   }
 });
 
@@ -229,7 +1081,7 @@ app.get('/api/download', async (req, res) => {
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Une erreur interne est survenue.' });
+  res.status(500).json({ error: ERROR_MESSAGES.serverError, code: 'INTERNAL_ERROR' });
 });
 
 app.listen(PORT, () => {

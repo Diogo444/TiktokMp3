@@ -1,6 +1,18 @@
-version: "3.9"
-
 services:
+  tiktokmp3-caddy:
+    container_name: tiktokmp3-caddy
+    image: caddy:2-alpine
+    networks:
+      - caddy_net
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - tiktokmp3-frontend
+      - tiktokmp3-backend
+    restart: unless-stopped
+
   tiktokmp3-backend:
     container_name: tiktokmp3-backend
     build:
@@ -12,9 +24,11 @@ services:
       TIKTOK_METADATA_ENDPOINT: ${TIKTOK_METADATA_ENDPOINT:-https://www.tikwm.com/api/}
       API_TIMEOUT_MS: ${API_TIMEOUT_MS:-15000}
       AUDIO_TIMEOUT_MS: ${AUDIO_TIMEOUT_MS:-30000}
+      FFMPEG_PATH: ${FFMPEG_PATH:-}
+      YOUTUBE_AUDIO_BITRATE: ${YOUTUBE_AUDIO_BITRATE:-192k}
+      YOUTUBE_PROVIDER: ${YOUTUBE_PROVIDER:-yt-dlp}
+      YTDLP_TIMEOUT_MS: ${YTDLP_TIMEOUT_MS:-45000}
     restart: unless-stopped
-    networks:
-      - caddy_net
 
   tiktokmp3-frontend:
     container_name: tiktokmp3-frontend
@@ -22,13 +36,15 @@ services:
       context: .
       dockerfile: packages/frontend/Dockerfile
       args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:3000}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
     depends_on:
       - tiktokmp3-backend
     restart: unless-stopped
-    networks:
-      - caddy_net
+
+volumes:
+  caddy_data:
+  caddy_config:
 
 networks:
   caddy_net:
-    external: true
+    driver: true
