@@ -18,6 +18,8 @@ services:
     build:
       context: .
       dockerfile: packages/backend/Dockerfile
+    networks:
+      - caddy_net
     environment:
       PORT: ${PORT:-3000}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
@@ -37,6 +39,8 @@ services:
       dockerfile: packages/frontend/Dockerfile
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+    networks:
+      - caddy_net
     depends_on:
       - tiktokmp3-backend
     restart: unless-stopped
@@ -47,4 +51,4 @@ volumes:
 
 networks:
   caddy_net:
-    driver: true
+    external: true

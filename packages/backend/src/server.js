@@ -4,7 +4,6 @@ import { existsSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 import { createGzip } from 'node:zlib';
 
-import ytdl from '@distube/ytdl-core';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express from 'express';
@@ -29,7 +28,8 @@ const ERROR_MESSAGES = {
   tiktokVideoPrivate: 'Cette vidéo TikTok semble privée ou supprimée. Vérifiez qu\'elle est accessible publiquement.',
   tiktokAudioNotFound: 'Impossible d\'extraire l\'audio de cette vidéo TikTok.',
   tiktokVideoNotFound: 'Impossible d\'extraire la vidéo TikTok.',
-  youtubeIdInvalid: 'Impossible d\'identifier la vidéo YouTube. Vérifiez le lien (formats acceptés: watch?v=..., youtu.be/..., shorts/...).',
+  ytdlpMissing: 'yt-dlp n\'est pas install\u00e9 sur le serveur. Contactez l\'administrateur.',
+  youtubeIdInvalid: 'Impossible d\'identifier la vid\u00e9o YouTube. V\u00e9rifiez le lien (formats accept\u00e9s: watch?v=..., youtu.be/..., shorts/...).',
   youtubeMetadataFailed: 'Impossible de récupérer les informations YouTube. Réessayez dans quelques instants.',
   youtubeStreamFailed: 'Impossible de récupérer les flux audio/vidéo YouTube.',
   ffmpegMissing: 'Le convertisseur audio (FFmpeg) n\'est pas disponible sur le serveur. Contactez l\'administrateur.',
@@ -444,54 +444,43 @@ app.post('/api/convert', async (req, res) => {
 
     const youtubeWatchUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
+    // yt-dlp est requis pour YouTube (ytdl-core est déprécié/archivé)
+    if (!isCommandAvailable('yt-dlp')) {
+      console.error('yt-dlp is not available on this server');
+      return res.status(500).json({
+        error: ERROR_MESSAGES.ytdlpMissing,
+        code: 'YTDLP_MISSING',
+      });
+    }
+
     let title = 'YouTube Audio';
     let author = 'YouTube';
     let duration = undefined;
     let cover = undefined;
 
-    if (YOUTUBE_PROVIDER === 'yt-dlp' && isCommandAvailable('yt-dlp')) {
-      try {
-        const ytdlpPayload = await getYtDlpInfo(youtubeWatchUrl, format);
-        title = ytdlpPayload?.title?.trim?.() || title;
-        author =
-          ytdlpPayload?.uploader?.trim?.() ||
-          ytdlpPayload?.channel?.trim?.() ||
-          ytdlpPayload?.creator?.trim?.() ||
-          author;
-        duration =
-          typeof ytdlpPayload?.duration === 'number'
-            ? ytdlpPayload.duration
-            : duration;
-        cover =
-          ytdlpPayload?.thumbnail ||
-          ytdlpPayload?.thumbnails?.at(-1)?.url ||
-          ytdlpPayload?.thumbnails?.[0]?.url ||
-          cover;
-      } catch (error) {
-        console.error('yt-dlp metadata error:', error);
-      }
-    }
-
-    if (title === 'YouTube Audio') {
-      let info;
-      try {
-        info = await ytdl.getBasicInfo(youtubeWatchUrl);
-      } catch (error) {
-        console.error('YouTube metadata error:', error);
-        return res.status(502).json({
-          error: ERROR_MESSAGES.youtubeMetadataFailed,
-          code: 'YOUTUBE_METADATA_FAILED',
-        });
-      }
-
-      const details = info?.videoDetails;
-      title = details?.title?.trim() || title;
+    try {
+      const ytdlpPayload = await getYtDlpInfo(youtubeWatchUrl, format);
+      title = ytdlpPayload?.title?.trim?.() || title;
       author =
-        details?.author?.name?.trim() ||
-        details?.ownerChannelName?.trim() ||
+        ytdlpPayload?.uploader?.trim?.() ||
+        ytdlpPayload?.channel?.trim?.() ||
+        ytdlpPayload?.creator?.trim?.() ||
         author;
-      duration = Number(details?.lengthSeconds ?? 0) || duration;
-      cover = details?.thumbnails?.at(-1)?.url || details?.thumbnails?.[0]?.url;
+      duration =
+        typeof ytdlpPayload?.duration === 'number'
+          ? ytdlpPayload.duration
+          : duration;
+      cover =
+        ytdlpPayload?.thumbnail ||
+        ytdlpPayload?.thumbnails?.at(-1)?.url ||
+        ytdlpPayload?.thumbnails?.[0]?.url ||
+        cover;
+    } catch (error) {
+      console.error('yt-dlp metadata error:', error);
+      return res.status(502).json({
+        error: ERROR_MESSAGES.youtubeMetadataFailed,
+        code: 'YOUTUBE_METADATA_FAILED',
+      });
     }
 
     const safeTitle = sanitizeFilename(title);
@@ -779,251 +768,11 @@ app.get('/api/download', async (req, res) => {
         return;
       }
 
-      const closeOnAbort = (streams, child) => {
-        res.on('close', () => {
-          if (!res.writableEnded) {
-            for (const stream of streams) {
-              try {
-                stream?.destroy?.();
-              } catch {
-                // ignore
-              }
-            }
-            try {
-              child?.kill?.('SIGKILL');
-            } catch {
-              // ignore
-            }
-          }
-        });
-      };
-
-      const attachFfmpegDiagnostics = (ffmpeg) => {
-        ffmpeg.on('error', (error) => {
-          console.error('ffmpeg spawn error:', error);
-          if (!res.headersSent) {
-            res.status(500).json({
-              error: ERROR_MESSAGES.ffmpegMissing,
-              code: 'FFMPEG_ERROR',
-            });
-          } else {
-            res.destroy(error);
-          }
-        });
-
-        ffmpeg.stderr.on('data', (chunk) => {
-          const message = chunk?.toString?.() || '';
-          if (message.trim()) {
-            console.error('ffmpeg stderr:', message.trim());
-          }
-        });
-      };
-
-      if (format === 'mp4') {
-        const info = await ytdl.getInfo(inputUrl);
-        const formats = info?.formats || [];
-
-        const pickVideo =
-          formats
-            .filter((f) => f.hasVideo && !f.hasAudio && f.container === 'mp4')
-            .sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
-          formats
-            .filter((f) => f.hasVideo && !f.hasAudio)
-            .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-
-        const pickAudio =
-          formats
-            .filter(
-              (f) =>
-                f.hasAudio &&
-                !f.hasVideo &&
-                (f.container === 'mp4' || f.container === 'm4a'),
-            )
-            .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0] ||
-          formats
-            .filter((f) => f.hasAudio && !f.hasVideo)
-            .sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
-
-        if (!pickVideo || !pickAudio) {
-          return res.status(400).json({
-            error: ERROR_MESSAGES.youtubeStreamFailed,
-            code: 'YOUTUBE_STREAMS_NOT_FOUND',
-          });
-        }
-
-        const videoCodec = (pickVideo.videoCodec || pickVideo.codecs || '').toLowerCase();
-        const audioCodec = (pickAudio.audioCodec || pickAudio.codecs || '').toLowerCase();
-        const isH264 = videoCodec.includes('avc1') || videoCodec.includes('h264');
-        const isAac = audioCodec.includes('mp4a') || audioCodec.includes('aac');
-
-        const audioBitrate = process.env.YOUTUBE_AUDIO_BITRATE || '192k';
-        const videoArgs = isH264
-          ? ['-c:v', 'copy']
-          : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23'];
-        const audioArgs = isAac
-          ? ['-c:a', 'copy']
-          : ['-c:a', 'aac', '-b:a', audioBitrate];
-
-        const ffmpeg = spawn(
-          ffmpegPath,
-          [
-            '-hide_banner',
-            '-loglevel',
-            'error',
-            '-i',
-            'pipe:0',
-            '-i',
-            'pipe:3',
-            '-map',
-            '0:v:0',
-            '-map',
-            '1:a:0',
-            ...videoArgs,
-            ...audioArgs,
-            '-shortest',
-            '-f',
-            'mp4',
-            '-movflags',
-            'frag_keyframe+empty_moov',
-            'pipe:1',
-          ],
-          { stdio: ['pipe', 'pipe', 'pipe', 'pipe'] },
-        );
-
-        res.setHeader('Content-Type', 'video/mp4');
-        res.setHeader(
-          'Content-Disposition',
-          `attachment; filename="${safeTitle}.mp4"`,
-        );
-        res.setHeader('Cache-Control', 'no-store');
-
-        attachFfmpegDiagnostics(ffmpeg);
-
-        const videoStream = ytdl.downloadFromInfo(info, {
-          format: pickVideo,
-          highWaterMark: 1 << 25,
-        });
-        const audioStream = ytdl.downloadFromInfo(info, {
-          format: pickAudio,
-          highWaterMark: 1 << 25,
-        });
-
-        videoStream.on('error', (error) => {
-          console.error('YouTube video stream error:', error);
-          res.destroy(error);
-        });
-        audioStream.on('error', (error) => {
-          console.error('YouTube audio stream error:', error);
-          res.destroy(error);
-        });
-
-        closeOnAbort([videoStream, audioStream], ffmpeg);
-
-        const inputVideo = pipeline(videoStream, ffmpeg.stdin);
-        const inputAudio = pipeline(audioStream, ffmpeg.stdio[3]);
-        const outputPipeline = pipeline(ffmpeg.stdout, res);
-        const ffmpegExit = new Promise((resolve, reject) => {
-          ffmpeg.on('close', (code) => {
-            if (code === 0) {
-              resolve();
-            } else {
-              reject(new Error(`ffmpeg exited with code ${code}`));
-            }
-          });
-        });
-
-        await Promise.all([inputVideo, inputAudio, outputPipeline, ffmpegExit]).catch(
-          (error) => {
-            if (error?.name === 'AbortError') {
-              return;
-            }
-            console.error('YouTube MP4 download error:', error);
-            if (!res.headersSent) {
-              res.status(500).json({
-                error: 'La conversion vidéo YouTube a échoué. Réessayez ou essayez une autre vidéo.',
-                code: 'YOUTUBE_MP4_DOWNLOAD_FAILED',
-              });
-            } else {
-              res.destroy(error);
-            }
-          },
-        );
-
-        return;
-      }
-
-      const youtubeStream = ytdl(inputUrl, {
-        filter: 'audioonly',
-        quality: 'highestaudio',
-        highWaterMark: 1 << 25,
+      // yt-dlp is required for YouTube downloads
+      return res.status(500).json({
+        error: 'yt-dlp n\'est pas disponible sur ce serveur. Contactez l\'administrateur.',
+        code: 'YTDLP_NOT_AVAILABLE',
       });
-
-      const audioBitrate = process.env.YOUTUBE_AUDIO_BITRATE || '192k';
-      const ffmpeg = spawn(
-        ffmpegPath,
-        [
-          '-hide_banner',
-          '-loglevel',
-          'error',
-          '-i',
-          'pipe:0',
-          '-vn',
-          '-acodec',
-          'libmp3lame',
-          '-b:a',
-          audioBitrate,
-          '-f',
-          'mp3',
-          'pipe:1',
-        ],
-        { stdio: ['pipe', 'pipe', 'pipe'] },
-      );
-
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader(
-        'Content-Disposition',
-        `attachment; filename="${safeTitle}.mp3"`,
-      );
-      res.setHeader('Cache-Control', 'no-store');
-
-      attachFfmpegDiagnostics(ffmpeg);
-      closeOnAbort([youtubeStream], ffmpeg);
-
-      youtubeStream.on('error', (error) => {
-        console.error('YouTube stream error:', error);
-        res.destroy(error);
-      });
-
-      const inputPipeline = pipeline(youtubeStream, ffmpeg.stdin);
-      const outputPipeline = pipeline(ffmpeg.stdout, res);
-      const ffmpegExit = new Promise((resolve, reject) => {
-        ffmpeg.on('close', (code) => {
-          if (code === 0) {
-            resolve();
-          } else {
-            reject(new Error(`ffmpeg exited with code ${code}`));
-          }
-        });
-      });
-
-      await Promise.all([inputPipeline, outputPipeline, ffmpegExit]).catch(
-        (error) => {
-          if (error?.name === 'AbortError') {
-            return;
-          }
-          console.error('YouTube download error:', error);
-          if (!res.headersSent) {
-            res.status(500).json({
-              error: 'La conversion audio YouTube a échoué. Réessayez ou essayez une autre vidéo.',
-              code: 'YOUTUBE_DOWNLOAD_FAILED',
-            });
-          } else {
-            res.destroy(error);
-          }
-        },
-      );
-
-      return;
     }
 
     const upstreamUrl = payload?.url;
