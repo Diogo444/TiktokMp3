@@ -256,9 +256,19 @@ const getYtDlpInfo = async (videoUrl, requestedFormat) => {
       ? 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
       : 'ba[ext=m4a]/ba/b';
 
+  const potProviderUrl = process.env.POT_PROVIDER_URL || '';
+  const args = ['-J', '--no-playlist', '--skip-download', '-f', formatSelector];
+  
+  // Add PO Token provider if configured
+  if (potProviderUrl) {
+    args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${potProviderUrl}`);
+  }
+  
+  args.push(videoUrl);
+
   const { stdout, stderr } = await runCommand(
     'yt-dlp',
-    ['-J', '--no-playlist', '--skip-download', '-f', formatSelector, videoUrl],
+    args,
     { timeoutMs: Number(process.env.YTDLP_TIMEOUT_MS ?? 45000) },
   );
 
