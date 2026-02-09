@@ -6,7 +6,7 @@ ENV PNPM_HOME=/pnpm
 ENV PATH="${PNPM_HOME}:${PATH}"
 
 RUN apk add --no-cache ffmpeg python3 py3-pip \
-    && pip3 install --break-system-packages -U yt-dlp bgutil-ytdlp-pot-provider
+    && pip3 install --break-system-packages -U yt-dlp
 
 RUN corepack enable
 

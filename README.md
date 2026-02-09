@@ -19,8 +19,9 @@ TiktokMp3/
 - Node.js >= 18
 - pnpm >= 8
 - FFmpeg (requis pour la conversion YouTube → MP3/MP4)
+- yt-dlp (requis pour l'extraction YouTube)
 
-Note pnpm : certains environnements bloquent les scripts d'installation. Si `ffmpeg-static` est installé sans binaire, lancez `pnpm approve-builds` et autorisez `ffmpeg-static`, ou installez FFmpeg sur votre machine et définissez `FFMPEG_PATH`.
+Note pnpm : certains environnements bloquent les scripts d'installation. Si `ffmpeg-static` est installé sans binaire, lancez `pnpm approve-builds` et autorisez `ffmpeg-static`, ou installez FFmpeg sur votre machine.
 
 ## Installation locale
 
@@ -48,21 +49,7 @@ Trois services sont fournis :
 
 ### Preparation
 
-Optionnel : definir un fichier `.env` a la racine pour surcharger les variables (valeurs par defaut ci-dessous) :
-
-```
-PORT=3000
-FRONTEND_ORIGIN=http://localhost:8080
-VITE_API_BASE_URL=http://localhost:8080
-TIKTOK_METADATA_ENDPOINT=https://www.tikwm.com/api/
-API_TIMEOUT_MS=15000
-AUDIO_TIMEOUT_MS=30000
-FFMPEG_PATH=
-YOUTUBE_AUDIO_BITRATE=192k
-YOUTUBE_PROVIDER=auto
-YTDLP_TIMEOUT_MS=45000
-YTDLP_COOKIES_FILE=
-```
+Aucun fichier `.env` n'est requis : la stack fonctionne directement avec les valeurs intégrées.
 
 ### Build et lancement
 
@@ -72,17 +59,17 @@ docker compose up --build
 
 Puis ouvrez `http://localhost:8080`. Caddy sert le frontend et reverse-proxy l'API.
 
+## Confidentialité et stockage
+
+- L'application convertit/télécharge en streaming.
+- Le backend ne conserve pas les fichiers MP3/MP4 téléchargés.
+- Les liens de téléchargement backend sont générés à la volée.
+
 ### Problème YouTube "Sign in to confirm you’re not a bot"
 
 Sur certaines IP (souvent VPS/datacenter), YouTube peut bloquer `yt-dlp` et demander une validation anti-bot.
-Dans ce cas, vous avez 2 options :
-- passer le backend en `YOUTUBE_PROVIDER=ytdl-core` (ou laisser `YOUTUBE_PROVIDER=auto`)
-- ou exporter vos cookies YouTube (format `cookies.txt` Netscape), les placer dans `./secrets/youtube-cookies.txt`
-(dossier ignoré par git), puis relancer en définissant :
-
-```
-YTDLP_COOKIES_FILE=/run/secrets/youtube-cookies.txt
-```
+Dans ce cas, placez vos cookies YouTube (format `cookies.txt` Netscape) dans `./secrets/youtube-cookies.txt`
+(dossier ignoré par git), puis relancez les conteneurs.
 
 ## Documentation additionnelle
 

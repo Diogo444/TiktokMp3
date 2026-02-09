@@ -1,128 +1,94 @@
 import { ref } from 'vue';
 
-// Configuration des timeouts et retries
-const DEFAULT_TIMEOUT_MS = 30000;
-const MAX_RETRIES = 2;
-const RETRY_DELAY_MS = 1000;
+const API_PREFIX = '/api';
+const DEFAULT_TIMEOUT_MS = 45000;
 
-// Messages d'erreur localisés
-const ERROR_MESSAGES = {
-  network: 'Problème de connexion réseau. Vérifiez votre connexion internet.',
-  timeout: 'La requête a pris trop de temps. Réessayez dans quelques instants.',
-  server: 'Le serveur a rencontré un problème. Réessayez plus tard.',
-  unknown: 'Une erreur inattendue est survenue.',
+const withTimeout = async (promiseFactory, timeoutMs) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await promiseFactory(controller.signal);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 };
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const parseErrorMessage = (error, response) => {
-  if (error?.name === 'AbortError') {
-    return ERROR_MESSAGES.timeout;
-  }
-  if (error?.message?.includes('fetch') || error?.message?.includes('network')) {
-    return ERROR_MESSAGES.network;
-  }
-  if (response?.status >= 500) {
-    return ERROR_MESSAGES.server;
-  }
-  return error?.message || ERROR_MESSAGES.unknown;
+const parseApiError = async (response) => {
+  const payload = await response.json().catch(() => null);
+  return payload?.error || `Erreur HTTP ${response.status}`;
 };
 
 export function useApi() {
   const loading = ref(false);
-  const error = ref(null);
-  const retryCount = ref(0);
+  const error = ref('');
 
-  const apiCall = async (endpoint, options = {}) => {
+  const request = async (endpoint, options = {}) => {
+    const {
+      timeout = DEFAULT_TIMEOUT_MS,
+      headers = {},
+      body,
+      ...rest
+    } = options;
+
     loading.value = true;
-    error.value = null;
-    retryCount.value = 0;
-
-    const timeoutMs = options.timeout ?? DEFAULT_TIMEOUT_MS;
-    const maxRetries = options.retries ?? MAX_RETRIES;
-
-    const executeRequest = async (attempt = 0) => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-      try {
-        const response = await fetch(`/api${endpoint}`, {
-          headers: {
-            'Content-Type': 'application/json',
-            ...options.headers,
-          },
-          ...options,
-          signal: controller.signal,
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!response.ok) {
-          const errorData = await response.json().catch(() => null);
-          const errorMessage = errorData?.error || `Erreur HTTP ${response.status}`;
-          throw new Error(errorMessage);
-        }
-
-        const data = await response.json();
-        return data;
-      } catch (err) {
-        clearTimeout(timeoutId);
-        
-        // Retry logic pour les erreurs réseau ou timeout
-        const isRetryable = err.name === 'AbortError' || 
-          err.message?.includes('fetch') || 
-          err.message?.includes('network');
-        
-        if (isRetryable && attempt < maxRetries) {
-          retryCount.value = attempt + 1;
-          await delay(RETRY_DELAY_MS * (attempt + 1));
-          return executeRequest(attempt + 1);
-        }
-        
-        throw err;
-      }
-    };
+    error.value = '';
 
     try {
-      return await executeRequest();
-    } catch (err) {
-      error.value = parseErrorMessage(err);
-      throw err;
+      return await withTimeout(async (signal) => {
+        const response = await fetch(`${API_PREFIX}${endpoint}`, {
+          signal,
+          headers: {
+            ...(body ? { 'Content-Type': 'application/json' } : {}),
+            ...headers,
+          },
+          ...(body ? { body: JSON.stringify(body) } : {}),
+          ...rest,
+        });
+
+        if (!response.ok) {
+          throw new Error(await parseApiError(response));
+        }
+
+        return await response.json();
+      }, timeout);
+    } catch (requestError) {
+      if (requestError?.name === 'AbortError') {
+        error.value = 'Requete expiree. Reessayez.';
+        throw new Error(error.value);
+      }
+
+      error.value = requestError?.message || 'Erreur API inconnue.';
+      throw requestError;
     } finally {
       loading.value = false;
     }
   };
 
-  const downloadVideo = async (url) => {
-    return apiCall('/download', {
+  const convert = (url, format = 'mp3') =>
+    request('/convert', {
       method: 'POST',
-      body: JSON.stringify({ url }),
-      timeout: 60000, // Plus long pour les téléchargements
+      body: { url, format },
     });
-  };
 
-  const checkHealth = async () => {
-    return apiCall('/health', {
-      timeout: 5000,
-      retries: 1,
+  const getCapabilities = () =>
+    request('/capabilities', {
+      method: 'GET',
+      timeout: 8000,
     });
-  };
 
-  const convert = async (url, format = 'mp3') => {
-    return apiCall('/convert', {
-      method: 'POST',
-      body: JSON.stringify({ url, format }),
-      timeout: 45000,
+  const checkHealth = () =>
+    request('/health', {
+      method: 'GET',
+      timeout: 8000,
     });
-  };
 
   return {
     loading,
     error,
-    retryCount,
-    downloadVideo,
-    checkHealth,
+    request,
     convert,
-    apiCall,
+    getCapabilities,
+    checkHealth,
   };
 }

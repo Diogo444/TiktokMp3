@@ -1,23 +1,25 @@
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { createGzip } from 'node:zlib';
 
 import cors from 'cors';
-import dotenv from 'dotenv';
 import express from 'express';
 import ffmpegStaticPath from 'ffmpeg-static';
 
-dotenv.config();
-
 const app = express();
-const PORT = process.env.PORT || 3000;
-const TIKTOK_METADATA_ENDPOINT =
-  process.env.TIKTOK_METADATA_ENDPOINT || 'https://www.tikwm.com/api/';
+const PORT = 3000;
+const TIKTOK_METADATA_ENDPOINT = 'https://www.tikwm.com/api/';
 
-const API_RESPONSE_TIMEOUT_MS = Number(process.env.API_TIMEOUT_MS ?? 15000);
+const API_RESPONSE_TIMEOUT_MS = 15000;
+const AUDIO_TIMEOUT_MS = 30000;
 const SUPPORTED_FORMATS = new Set(['mp3', 'mp4']);
+const YTDLP_BINARY = 'yt-dlp';
+const YTDLP_DISABLE_CACHE = true;
+const YTDLP_TIMEOUT_MS = 45000;
+const YOUTUBE_AUDIO_BITRATE = '192k';
+const YTDLP_COOKIES_FILE = '/run/secrets/youtube-cookies.txt';
 
 // Messages d'erreur centralisés pour cohérence
 const ERROR_MESSAGES = {
@@ -39,6 +41,15 @@ const ERROR_MESSAGES = {
   sourceInvalid: 'Le lien de téléchargement est invalide ou expiré. Relancez la conversion.',
 };
 
+const setNoStoreHeaders = (res) => {
+  res.setHeader(
+    'Cache-Control',
+    'no-store, no-cache, must-revalidate, proxy-revalidate',
+  );
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+};
+
 // Middleware
 app.use(cors());
 app.options('*', cors());
@@ -49,10 +60,15 @@ app.use(express.urlencoded({ extended: true }));
 app.use((req, res, next) => {
   // Ajouter le timing de la requête
   req.startTime = Date.now();
-  
+
   // Headers de cache pour les APIs
   res.setHeader('X-Content-Type-Options', 'nosniff');
-  
+  res.setHeader('Referrer-Policy', 'no-referrer');
+
+  if (req.path.startsWith('/api/')) {
+    setNoStoreHeaders(res);
+  }
+
   next();
 });
 
@@ -63,7 +79,7 @@ const sanitizeFilename = (value = '') =>
     .replace(/[^\w\s-]/g, '')
     .trim()
     .replace(/\s+/g, '-')
-    .slice(0, 80) || `tiktok-audio-${crypto.randomInt(1000, 9999)}`;
+    .slice(0, 80) || `media-${crypto.randomInt(1000, 9999)}`;
 
 const isTikTokUrl = (value = '') => {
   try {
@@ -144,15 +160,11 @@ const decodeSource = (value) => {
   try {
     return JSON.parse(decoded);
   } catch (error) {
-    return { platform: 'tiktok', url: decoded };
+    throw new Error('SOURCE_INVALID');
   }
 };
 
 const resolveFfmpegPath = () => {
-  if (process.env.FFMPEG_PATH) {
-    return process.env.FFMPEG_PATH;
-  }
-
   if (
     typeof ffmpegStaticPath === 'string' &&
     ffmpegStaticPath.length > 0 &&
@@ -263,42 +275,33 @@ const getYtDlpInfo = async (videoUrl, requestedFormat) => {
       ? 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
       : 'ba[ext=m4a]/ba/b';
 
-  const potProviderUrl = process.env.POT_PROVIDER_URL || '';
   const args = ['-J', '--no-playlist', '--skip-download', '-f', formatSelector];
 
-  const cookiesFileFromEnv = (process.env.YTDLP_COOKIES_FILE || '').trim();
-  const defaultCookiesFile = '/run/secrets/youtube-cookies.txt';
-  const cookiesFile =
-    cookiesFileFromEnv ||
-    (existsSync(defaultCookiesFile) ? defaultCookiesFile : '');
+  if (YTDLP_DISABLE_CACHE) {
+    args.push('--no-cache-dir');
+  }
+
+  const cookiesFile = existsSync(YTDLP_COOKIES_FILE) ? YTDLP_COOKIES_FILE : '';
 
   if (cookiesFile) {
-    if (existsSync(cookiesFile)) {
-      args.push('--cookies', cookiesFile);
-    } else {
-      console.warn(
-        `YTDLP_COOKIES_FILE is set but file does not exist: ${cookiesFile}`,
-      );
-    }
+    args.push('--cookies', cookiesFile);
   }
    
-  // Add PO Token provider if configured
-  if (potProviderUrl) {
-    // Use mweb client which works better with PO Tokens
-    args.push('--extractor-args', `youtube:player-client=mweb`);
-    args.push('--extractor-args', `youtubepot-bgutilhttp:base_url=${potProviderUrl}`);
-    console.log(`[yt-dlp] Using PO Token provider: ${potProviderUrl}`);
-  } else if (!cookiesFile) {
-    console.warn('[yt-dlp] No PO Token provider or cookies configured - YouTube may block requests');
+  if (!cookiesFile) {
+    console.warn('[yt-dlp] No cookies configured - YouTube may block requests');
   }
   
   args.push(videoUrl);
-  console.log(`[yt-dlp] Running with args: ${args.filter(a => !a.includes('cookie')).join(' ')}`);
+  console.log(
+    `[yt-dlp] Running with args: ${args
+      .filter((entry) => !entry.includes('cookie'))
+      .join(' ')}`,
+  );
 
   const { stdout, stderr } = await runCommand(
-    'yt-dlp',
+    YTDLP_BINARY,
     args,
-    { timeoutMs: Number(process.env.YTDLP_TIMEOUT_MS ?? 45000) },
+    { timeoutMs: YTDLP_TIMEOUT_MS },
   );
 
   if (stderr?.trim()) {
@@ -349,13 +352,60 @@ const fetchWithTimeout = async (url, options = {}) => {
   }
 };
 
+const toNodeReadable = (stream) => {
+  if (!stream) {
+    return null;
+  }
+  if (typeof stream.pipe === 'function') {
+    return stream;
+  }
+  if (typeof Readable.fromWeb === 'function') {
+    return Readable.fromWeb(stream);
+  }
+  return null;
+};
+
+const getRuntimeCapabilities = () => {
+  const ffmpegPath = resolveFfmpegPath();
+  return {
+    streamingOnly: true,
+    formats: ['mp3', 'mp4'],
+    platforms: ['tiktok', 'youtube'],
+    binaries: {
+      ytDlp: {
+        available: isCommandAvailable(YTDLP_BINARY),
+        binary: YTDLP_BINARY,
+      },
+      ffmpeg: {
+        available: isFfmpegAvailable(ffmpegPath),
+        binary: ffmpegPath,
+      },
+    },
+  };
+};
+
 // Routes
 app.get('/', (req, res) => {
   res.json({ message: 'TikTok / YouTube MP3 API is running' });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
+  const capabilities = getRuntimeCapabilities();
+  res.json({
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    provider: {
+      ytDlpAvailable: capabilities.binaries.ytDlp.available,
+      ffmpegAvailable: capabilities.binaries.ffmpeg.available,
+    },
+  });
+});
+
+app.get('/api/capabilities', (req, res) => {
+  res.json({
+    ...getRuntimeCapabilities(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 app.post('/api/convert', async (req, res) => {
@@ -489,7 +539,7 @@ app.post('/api/convert', async (req, res) => {
     let cover = undefined;
 
     try {
-      if (!isCommandAvailable('yt-dlp')) {
+      if (!isCommandAvailable(YTDLP_BINARY)) {
         console.error('yt-dlp is not available on this server');
         return res.status(500).json({
           error: ERROR_MESSAGES.ytdlpMissing,
@@ -519,13 +569,13 @@ app.post('/api/convert', async (req, res) => {
       if (isYouTubeBotProtectionError(error?.stderr)) {
         return res.status(403).json({
           error:
-            'YouTube demande une validation "anti-bot" depuis ce serveur. Configurez des cookies (YTDLP_COOKIES_FILE) ou un provider PO Token (POT_PROVIDER_URL), puis réessayez.',
+            'YouTube demande une validation "anti-bot" depuis ce serveur. Ajoutez un fichier secrets/youtube-cookies.txt puis réessayez.',
           code: 'YOUTUBE_AUTH_REQUIRED',
         });
       } else if (isLikelyYouTubeBlockedError(error)) {
         return res.status(403).json({
           error:
-            'YouTube refuse la requête depuis ce serveur (anti-bot / rate-limit). Essayez une autre IP/réseau ou configurez des cookies/PO Tokens.',
+            'YouTube refuse la requête depuis ce serveur (anti-bot / rate-limit). Essayez une autre IP/réseau ou ajoutez des cookies YouTube.',
           code: 'YOUTUBE_BLOCKED',
         });
       }
@@ -613,7 +663,7 @@ app.get('/api/download', async (req, res) => {
         });
       }
       const inputUrl = `https://www.youtube.com/watch?v=${videoId}`;
-      if (isCommandAvailable('yt-dlp')) {
+      if (isCommandAvailable(YTDLP_BINARY)) {
         let ytdlpPayload;
         try {
           ytdlpPayload = await getYtDlpInfo(inputUrl, format);
@@ -622,7 +672,7 @@ app.get('/api/download', async (req, res) => {
           if (isYouTubeBotProtectionError(error?.stderr)) {
             return res.status(403).json({
               error:
-                'YouTube demande une validation "anti-bot" depuis ce serveur. Configurez des cookies (YTDLP_COOKIES_FILE) ou un provider PO Token (POT_PROVIDER_URL), puis réessayez.',
+                'YouTube demande une validation "anti-bot" depuis ce serveur. Ajoutez un fichier secrets/youtube-cookies.txt puis réessayez.',
               code: 'YOUTUBE_AUTH_REQUIRED',
             });
           }
@@ -640,7 +690,7 @@ app.get('/api/download', async (req, res) => {
           });
         }
 
-        const audioBitrate = process.env.YOUTUBE_AUDIO_BITRATE || '192k';
+        const audioBitrate = YOUTUBE_AUDIO_BITRATE;
         const ffmpegArgs = ['-hide_banner', '-loglevel', 'error'];
 
         if (format === 'mp4') {
@@ -840,10 +890,11 @@ app.get('/api/download', async (req, res) => {
     }
 
     const upstreamResponse = await fetchWithTimeout(upstreamUrl, {
-      timeout: Number(process.env.AUDIO_TIMEOUT_MS ?? 30000),
+      timeout: AUDIO_TIMEOUT_MS,
     });
 
-    if (!upstreamResponse.ok || !upstreamResponse.body) {
+    const upstreamBody = toNodeReadable(upstreamResponse.body);
+    if (!upstreamResponse.ok || !upstreamBody) {
       console.error(
         'Audio upstream error:',
         upstreamResponse.status,
@@ -863,9 +914,8 @@ app.get('/api/download', async (req, res) => {
       'Content-Disposition',
       `attachment; filename="${safeTitle}.${fileExt}"`,
     );
-    res.setHeader('Cache-Control', 'no-store');
 
-    await pipeline(upstreamResponse.body, res);
+    await pipeline(upstreamBody, res);
   } catch (error) {
     if (error.name === 'AbortError') {
       console.error('Audio upstream timeout:', error);

@@ -27,8 +27,6 @@ TiktokMp3/
 │   └── backend/                     # API Node.js + Express
 │       ├── src/
 │       │   └── server.js           # Serveur Express
-│       ├── .env                     # Variables d'environnement
-│       ├── .env.example
 │       ├── .gitignore
 │       ├── package.json
 │       └── README.md
@@ -208,7 +206,7 @@ pnpm build
 ## 📝 Notes importantes
 
 - Le backend utilise le mode `--watch` de Node.js (nécessite Node.js 18+)
-- Les variables d'environnement sont dans `packages/backend/.env`
+- Aucun fichier `.env` n'est requis pour lancer le backend
 - Le frontend communique avec le backend via le proxy Vite configuré
 - En production, vous devrez configurer CORS et les URLs correctement
 

@@ -13,13 +13,6 @@ services:
       - tiktokmp3-backend
     restart: unless-stopped
 
-  tiktokmp3-pot-provider:
-    container_name: tiktokmp3-pot-provider
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
-    networks:
-      - caddy_net
-    restart: unless-stopped
-
   tiktokmp3-backend:
     container_name: tiktokmp3-backend
     build:
@@ -29,19 +22,6 @@ services:
       - caddy_net
     volumes:
       - ./secrets:/run/secrets:ro
-    depends_on:
-      - tiktokmp3-pot-provider
-    environment:
-      PORT: ${PORT:-3000}
-      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:8080}
-      TIKTOK_METADATA_ENDPOINT: ${TIKTOK_METADATA_ENDPOINT:-https://www.tikwm.com/api/}
-      API_TIMEOUT_MS: ${API_TIMEOUT_MS:-15000}
-      AUDIO_TIMEOUT_MS: ${AUDIO_TIMEOUT_MS:-30000}
-      FFMPEG_PATH: ${FFMPEG_PATH:-}
-      YOUTUBE_AUDIO_BITRATE: ${YOUTUBE_AUDIO_BITRATE:-192k}
-      YTDLP_TIMEOUT_MS: ${YTDLP_TIMEOUT_MS:-45000}
-      YTDLP_COOKIES_FILE: ${YTDLP_COOKIES_FILE:-/run/secrets/youtube-cookies.txt}
-      POT_PROVIDER_URL: ${POT_PROVIDER_URL:-http://tiktokmp3-pot-provider:4416}
     restart: unless-stopped
 
   tiktokmp3-frontend:
@@ -49,8 +29,6 @@ services:
     build:
       context: .
       dockerfile: packages/frontend/Dockerfile
-      args:
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
     networks:
       - caddy_net
     depends_on:

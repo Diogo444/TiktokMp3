@@ -1,6 +1,6 @@
-# TikTok MP3 - Frontend
+# YouTube / TikTok MP3-MP4 - Frontend
 
-Application Vue.js pour télécharger et convertir des vidéos TikTok en MP3.
+Application Vue 3 pour convertir des URLs YouTube ou TikTok en MP3/MP4.
 
 ## Installation
 
@@ -33,3 +33,10 @@ pnpm preview
 - Vue 3 avec `<script setup>`
 - Vite
 - JavaScript ES6+
+
+## Fonctionnalités UI
+
+- Détection automatique de plateforme (YouTube/TikTok)
+- Sélection MP3 ou MP4
+- Affichage de l'état runtime backend (`/api/capabilities`)
+- Téléchargement direct côté navigateur

@@ -11,25 +11,13 @@ pnpm install
 ## Prérequis (YouTube)
 
 - FFmpeg (conversion YouTube → mp3/mp4)
-- Option pnpm : si les scripts sont bloqués, lancez `pnpm approve-builds` et autorisez `ffmpeg-static`, ou installez FFmpeg et définissez `FFMPEG_PATH`.
-- Le backend supporte `yt-dlp` (recommandé) et `@distube/ytdl-core` (fallback Node). Configurez `YOUTUBE_PROVIDER` selon votre environnement (`auto`, `yt-dlp`, `ytdl-core`).
+- Option pnpm : si les scripts sont bloqués, lancez `pnpm approve-builds` et autorisez `ffmpeg-static`, ou installez FFmpeg.
+- Le backend utilise `yt-dlp` pour l'extraction YouTube.
 
 ### Erreur YouTube "Sign in to confirm you’re not a bot"
 
 Sur certaines IP (souvent VPS/datacenter), YouTube peut bloquer `yt-dlp` et demander une validation anti-bot.
-Dans ce cas, configurez un fichier de cookies (format `cookies.txt` Netscape) et définissez :
-
-```
-YTDLP_COOKIES_FILE=/run/secrets/youtube-cookies.txt
-```
-
-## Configuration
-
-Copiez le fichier `.env.example` en `.env` et configurez vos variables d'environnement :
-
-```bash
-cp .env.example .env
-```
+Dans ce cas, ajoutez un fichier `secrets/youtube-cookies.txt` (format Netscape).
 
 ## Développement
 
@@ -47,6 +35,9 @@ Retourne un message de bienvenue
 ### GET /api/health
 Vérifie le statut de l'API
 
+### GET /api/capabilities
+Retourne les capacités runtime (binaries détectés, plateformes/formats supportés).
+
 ### POST /api/convert
 Détecte automatiquement TikTok vs YouTube et retourne les métadonnées + un lien de téléchargement.
 - Body: `{ "url": "https://www.tiktok.com/...", "format": "mp3" }`
@@ -56,3 +47,8 @@ Détecte automatiquement TikTok vs YouTube et retourne les métadonnées + un li
 
 ### GET /api/download?source=...&title=...
 Télécharge l'audio (mp3) correspondant au `source` renvoyé par `/api/convert`.
+
+## Politique de stockage
+
+- Le backend streame les flux vers le client (n'écrit pas les MP3/MP4 sur disque).
+- Les liens `source` sont générés à la volée et utilisés directement.
