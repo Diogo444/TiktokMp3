@@ -363,8 +363,8 @@ const cleanupRuntimeCookiesFile = (runtimeFile = '') => {
 const getYtDlpInfo = async (videoUrl, requestedFormat) => {
   const formatSelector =
     requestedFormat === 'mp4'
-      ? `b[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}]/b[ext=mp4][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}]/bv*[ext=mp4][vcodec^=avc1][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}]+ba[ext=m4a][acodec^=mp4a]/bv*[ext=mp4][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}]+ba[ext=m4a]/b[ext=mp4]/b`
-      : 'ba[ext=m4a]/ba/b';
+      ? `bv*[ext=mp4][vcodec^=avc1][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}][protocol^=http]+ba[ext=m4a][acodec^=mp4a][protocol^=http]/bv*[ext=mp4][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}][protocol^=http]+ba[ext=m4a][protocol^=http]/b[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}][protocol^=http]/b[ext=mp4][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}][protocol^=http]/b[ext=mp4][protocol^=http]/b`
+      : 'ba[ext=m4a][protocol^=http]/ba[protocol^=http]/ba/b';
 
   const baseArgs = [
     '-J',
@@ -948,6 +948,11 @@ app.get('/api/download', async (req, res) => {
 
           if (audioInput && selectedInputs.length === 2) {
             ffmpegArgs.push('-map', '0:v:0', '-map', '1:a:0');
+          }
+
+          // Some YouTube AAC streams need ADTS->ASC conversion when remuxed to MP4.
+          if (audioInput && isAac) {
+            ffmpegArgs.push('-bsf:a', 'aac_adtstoasc');
           }
 
           ffmpegArgs.push(
