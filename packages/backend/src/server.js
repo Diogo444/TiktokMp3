@@ -76,6 +76,10 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+  res.setHeader(
+    'Access-Control-Expose-Headers',
+    'Content-Disposition, Content-Type, Content-Length',
+  );
 
   if (req.path.startsWith('/api/')) {
     setNoStoreHeaders(res);
@@ -92,6 +96,18 @@ const sanitizeFilename = (value = '') =>
     .trim()
     .replace(/\s+/g, '-')
     .slice(0, 80) || `media-${crypto.randomInt(1000, 9999)}`;
+
+const encodeRfc5987 = (value = '') =>
+  encodeURIComponent(value).replace(/['()*]/g, (char) =>
+    `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+
+const buildContentDisposition = (filename = 'media.bin') => {
+  const safeName = filename.replace(/"/g, '');
+  return `attachment; filename="${safeName}"; filename*=UTF-8''${encodeRfc5987(
+    safeName,
+  )}`;
+};
 
 const isTikTokUrl = (value = '') => {
   try {
@@ -836,7 +852,7 @@ app.get('/api/download', async (req, res) => {
           res.setHeader('Content-Type', 'video/mp4');
           res.setHeader(
             'Content-Disposition',
-            `attachment; filename="${safeTitle}.mp4"`,
+            buildContentDisposition(`${safeTitle}.mp4`),
           );
           res.setHeader('Cache-Control', 'no-store');
 
@@ -914,7 +930,7 @@ app.get('/api/download', async (req, res) => {
         res.setHeader('Content-Type', 'audio/mpeg');
         res.setHeader(
           'Content-Disposition',
-          `attachment; filename="${safeTitle}.mp3"`,
+          buildContentDisposition(`${safeTitle}.mp3`),
         );
         res.setHeader('Cache-Control', 'no-store');
 
@@ -1002,7 +1018,7 @@ app.get('/api/download', async (req, res) => {
     res.setHeader('Content-Type', contentType);
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${safeTitle}.${fileExt}"`,
+      buildContentDisposition(`${safeTitle}.${fileExt}`),
     );
 
     await pipeline(upstreamBody, res);

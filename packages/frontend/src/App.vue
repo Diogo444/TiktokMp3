@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 
 import { useApi } from './composables/useApi';
 
@@ -12,12 +12,17 @@ const statusTone = ref('idle'); // idle | loading | success | warning | error
 const isSubmitting = ref(false);
 const isDownloading = ref(false);
 const result = ref(null);
-const previewObjectUrl = ref('');
 
 const IOS_USER_AGENT_MATCH =
   /iPad|iPhone|iPod/.test(navigator.userAgent) ||
   (navigator.userAgent.includes('Mac') && navigator.maxTouchPoints > 2);
 const isIOS = ref(IOS_USER_AGENT_MATCH);
+const isAndroid = ref(/Android/i.test(navigator.userAgent));
+const isInAppBrowser = ref(
+  /(FBAN|FBAV|Instagram|Line|MicroMessenger|TikTok|Twitter|Snapchat|; wv\)|\bwv\b)/i.test(
+    navigator.userAgent,
+  ),
+);
 
 const detectPlatform = (value = '') => {
   try {
@@ -45,17 +50,6 @@ const detectPlatform = (value = '') => {
     return null;
   }
 };
-
-const clearPreviewUrl = () => {
-  if (previewObjectUrl.value) {
-    URL.revokeObjectURL(previewObjectUrl.value);
-    previewObjectUrl.value = '';
-  }
-};
-
-onBeforeUnmount(() => {
-  clearPreviewUrl();
-});
 
 const detectedPlatform = computed(() =>
   detectPlatform(urlValue.value.trim()),
@@ -102,7 +96,18 @@ const prettyDuration = computed(() => {
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 });
 
-const isMp4Result = computed(() => result.value?.format === 'mp4');
+const compatibilityHint = computed(() => {
+  if (isInAppBrowser.value) {
+    return 'Le navigateur integre de certaines apps peut bloquer le telechargement. Ouvrez la page dans Safari/Chrome si besoin.';
+  }
+  if (isIOS.value) {
+    return 'iPhone/iPad: confirmez "Telecharger", puis retrouvez le fichier dans l app Fichiers > Telechargements.';
+  }
+  if (isAndroid.value) {
+    return 'Android: le fichier apparait dans Telechargements (ou dans le gestionnaire de fichiers).';
+  }
+  return '';
+});
 
 const setStatus = (tone, message) => {
   statusTone.value = tone;
@@ -120,15 +125,27 @@ const toAbsoluteUrl = (pathOrUrl) => {
   }
 };
 
-const parseErrorResponse = async (response, fallbackMessage) => {
-  const payload = await response.json().catch(() => null);
-  return payload?.error || fallbackMessage;
+const openDirectInCurrentTab = (url) => {
+  window.location.assign(url);
+};
+
+const triggerNativeDownload = (url, fileName = '') => {
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  if (fileName) {
+    anchor.download = fileName;
+  }
+  anchor.rel = 'noopener';
+  anchor.target = '_self';
+  anchor.style.setProperty('display', 'none');
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
 };
 
 watch([urlValue, outputFormat], () => {
   if (result.value) {
     result.value = null;
-    clearPreviewUrl();
   }
 });
 
@@ -149,7 +166,6 @@ const handleConvert = async () => {
   }
 
   isSubmitting.value = true;
-  clearPreviewUrl();
   setStatus('loading', 'Analyse du lien et preparation du telechargement...');
 
   try {
@@ -191,53 +207,31 @@ const handleDownload = async () => {
   }
 
   isDownloading.value = true;
-  setStatus('loading', 'Telechargement en cours...');
+  setStatus('loading', 'Lancement du telechargement...');
 
   try {
-    const response = await fetch(result.value.downloadUrl, {
-      cache: 'no-store',
-    });
-    if (!response.ok) {
-      const message = await parseErrorResponse(
-        response,
-        'Impossible de telecharger le fichier.',
-      );
-      throw new Error(message);
-    }
-
-    const blob = await response.blob();
-    if (!blob || blob.size === 0) {
-      throw new Error('Le fichier recu est vide.');
-    }
-
-    const mimeType = result.value.format === 'mp4' ? 'video/mp4' : 'audio/mpeg';
-    const downloadBlob = new Blob([blob], { type: mimeType });
-    clearPreviewUrl();
-    const objectUrl = URL.createObjectURL(downloadBlob);
-    previewObjectUrl.value = objectUrl;
-
-    if (isIOS.value) {
-      window.open(objectUrl, '_blank', 'noopener');
+    if (isInAppBrowser.value || isIOS.value) {
+      openDirectInCurrentTab(result.value.downloadUrl);
       setStatus(
-        'success',
-        'Fichier ouvert. Utilisez Partager puis Enregistrer dans Fichiers.',
+        isInAppBrowser.value ? 'warning' : 'success',
+        compatibilityHint.value || 'Telechargement lance.',
       );
       return;
     }
 
-    const anchor = document.createElement('a');
-    anchor.href = objectUrl;
-    anchor.download = result.value.fileName;
-    anchor.rel = 'noopener';
-    anchor.style.setProperty('display', 'none');
-    document.body.appendChild(anchor);
-    anchor.click();
-    document.body.removeChild(anchor);
-
+    triggerNativeDownload(result.value.downloadUrl, result.value.fileName);
     const formatLabel = result.value.format === 'mp4' ? 'MP4' : 'MP3';
-    setStatus('success', `${formatLabel} telecharge.`);
+    setStatus('success', `${formatLabel} telechargement lance.`);
   } catch (error) {
-    setStatus('error', error?.message || 'Le telechargement a echoue.');
+    try {
+      openDirectInCurrentTab(result.value.downloadUrl);
+      setStatus(
+        'warning',
+        'Mode direct active. Si rien ne se passe, ouvrez le lien dans Safari/Chrome.',
+      );
+    } catch {
+      setStatus('error', error?.message || 'Le telechargement a echoue.');
+    }
   } finally {
     isDownloading.value = false;
   }
@@ -308,6 +302,9 @@ const handleDownload = async () => {
       <p v-if="statusMessage" :class="statusClass" aria-live="polite">
         {{ statusMessage }}
       </p>
+      <p v-if="compatibilityHint" class="status status--warning" aria-live="polite">
+        {{ compatibilityHint }}
+      </p>
 
       <transition name="reveal">
         <article v-if="result" class="result card" aria-live="polite">
@@ -346,14 +343,15 @@ const handleDownload = async () => {
                 }}
               </span>
             </button>
-            <a class="btn btn--ghost" :href="result.downloadUrl" rel="noopener" target="_blank">
-              Ouvrir le flux direct
+            <a
+              class="btn btn--ghost"
+              :href="result.downloadUrl"
+              :download="result.fileName"
+              rel="noopener"
+              target="_self"
+            >
+              Telechargement direct (compatibilite)
             </a>
-          </div>
-
-          <div v-if="previewObjectUrl" class="preview">
-            <video v-if="isMp4Result" :src="previewObjectUrl" controls preload="metadata" />
-            <audio v-else :src="previewObjectUrl" controls preload="metadata" />
           </div>
         </article>
       </transition>
