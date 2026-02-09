@@ -20,9 +20,13 @@ const SUPPORTED_FORMATS = new Set(['mp3', 'mp4']);
 const YTDLP_BINARY = 'yt-dlp';
 const YTDLP_DISABLE_CACHE = true;
 const YTDLP_TIMEOUT_MS = 45000;
-const YOUTUBE_AUDIO_BITRATE = '192k';
+const YOUTUBE_AUDIO_BITRATE = '160k';
+const YOUTUBE_MAX_VIDEO_HEIGHT = 720;
 const YTDLP_COOKIES_FILE = '/run/secrets/youtube-cookies.txt';
 const YTDLP_TMP_DIR = join(tmpdir(), 'yt-dlp-runtime');
+const YOUTUBE_INPUTS_CACHE_TTL_MS = 10 * 60 * 1000;
+const YOUTUBE_INPUTS_CACHE_MAX_ITEMS = 500;
+const youtubeInputsCache = new Map();
 
 // Messages d'erreur centralisés pour cohérence
 const ERROR_MESSAGES = {
@@ -359,7 +363,7 @@ const cleanupRuntimeCookiesFile = (runtimeFile = '') => {
 const getYtDlpInfo = async (videoUrl, requestedFormat) => {
   const formatSelector =
     requestedFormat === 'mp4'
-      ? 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
+      ? `b[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}]/b[ext=mp4][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}]/bv*[ext=mp4][vcodec^=avc1][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}]+ba[ext=m4a][acodec^=mp4a]/bv*[ext=mp4][height<=${YOUTUBE_MAX_VIDEO_HEIGHT}]+ba[ext=m4a]/b[ext=mp4]/b`
       : 'ba[ext=m4a]/ba/b';
 
   const baseArgs = [
@@ -451,6 +455,74 @@ const normalizeYtDlpInputs = (payload, fallbackHeaders) => {
       acodec: (fmt?.acodec || '').toString(),
     }))
     .filter((entry) => typeof entry.url === 'string' && entry.url.length > 0);
+};
+
+const pruneYouTubeInputsCache = () => {
+  const now = Date.now();
+  for (const [key, entry] of youtubeInputsCache.entries()) {
+    if (!entry || now - entry.createdAt > YOUTUBE_INPUTS_CACHE_TTL_MS) {
+      youtubeInputsCache.delete(key);
+    }
+  }
+
+  const overflow = youtubeInputsCache.size - YOUTUBE_INPUTS_CACHE_MAX_ITEMS;
+  if (overflow > 0) {
+    let removed = 0;
+    for (const key of youtubeInputsCache.keys()) {
+      youtubeInputsCache.delete(key);
+      removed += 1;
+      if (removed >= overflow) {
+        break;
+      }
+    }
+  }
+};
+
+const storeYouTubeInputsCache = ({ videoId, format, inputs }) => {
+  if (!videoId || !format || !Array.isArray(inputs) || inputs.length === 0) {
+    return '';
+  }
+
+  pruneYouTubeInputsCache();
+  const cacheKey = crypto.randomBytes(12).toString('hex');
+  const normalizedInputs = inputs.map((entry) => ({
+    url: entry.url,
+    headers: entry.headers && typeof entry.headers === 'object' ? { ...entry.headers } : {},
+    vcodec: (entry.vcodec || '').toString(),
+    acodec: (entry.acodec || '').toString(),
+  }));
+
+  youtubeInputsCache.set(cacheKey, {
+    createdAt: Date.now(),
+    videoId,
+    format,
+    inputs: normalizedInputs,
+  });
+  return cacheKey;
+};
+
+const getYouTubeInputsFromCache = ({ cacheKey, videoId, format }) => {
+  if (!cacheKey || typeof cacheKey !== 'string') {
+    return null;
+  }
+
+  pruneYouTubeInputsCache();
+  const entry = youtubeInputsCache.get(cacheKey);
+  if (!entry) {
+    return null;
+  }
+
+  if (
+    entry.videoId !== videoId ||
+    entry.format !== format ||
+    !Array.isArray(entry.inputs) ||
+    entry.inputs.length === 0
+  ) {
+    youtubeInputsCache.delete(cacheKey);
+    return null;
+  }
+
+  return entry.inputs;
 };
 
 const fetchWithTimeout = async (url, options = {}) => {
@@ -656,6 +728,7 @@ app.post('/api/convert', async (req, res) => {
     let author = 'YouTube';
     let duration = undefined;
     let cover = undefined;
+    let cachedStreamInputs = [];
 
     try {
       if (!isCommandAvailable(YTDLP_BINARY)) {
@@ -667,6 +740,7 @@ app.post('/api/convert', async (req, res) => {
       }
 
       const ytdlpPayload = await getYtDlpInfo(youtubeWatchUrl, format);
+      cachedStreamInputs = normalizeYtDlpInputs(ytdlpPayload);
       title = ytdlpPayload?.title?.trim?.() || title;
       author =
         ytdlpPayload?.uploader?.trim?.() ||
@@ -705,7 +779,17 @@ app.post('/api/convert', async (req, res) => {
     }
 
     const safeTitle = sanitizeFilename(title);
-    const encodedSource = encodeSource({ platform: 'youtube', format, id: videoId });
+    const cacheKey = storeYouTubeInputsCache({
+      videoId,
+      format,
+      inputs: cachedStreamInputs,
+    });
+    const encodedSource = encodeSource({
+      platform: 'youtube',
+      format,
+      id: videoId,
+      ...(cacheKey ? { cacheKey } : {}),
+    });
 
     res.json({
       success: true,
@@ -787,26 +871,38 @@ app.get('/api/download', async (req, res) => {
         });
       }
       const inputUrl = `https://www.youtube.com/watch?v=${videoId}`;
-      if (isCommandAvailable(YTDLP_BINARY)) {
-        let ytdlpPayload;
-        try {
-          ytdlpPayload = await getYtDlpInfo(inputUrl, format);
-        } catch (error) {
-          console.error('yt-dlp info error:', error);
-          if (isYouTubeBotProtectionError(error?.stderr)) {
-            return res.status(403).json({
-              error:
-                'YouTube demande une validation "anti-bot" depuis ce serveur. Ajoutez un fichier secrets/youtube-cookies.txt puis réessayez.',
-              code: 'YOUTUBE_AUTH_REQUIRED',
+      const cachedInputs = getYouTubeInputsFromCache({
+        cacheKey: payload?.cacheKey,
+        videoId,
+        format,
+      });
+
+      if (cachedInputs?.length > 0 || isCommandAvailable(YTDLP_BINARY)) {
+        let inputs = cachedInputs || [];
+        if (inputs.length > 0) {
+          console.log('[yt-dlp] Cache hit: reusing pre-resolved stream URLs');
+        } else {
+          let ytdlpPayload;
+          try {
+            ytdlpPayload = await getYtDlpInfo(inputUrl, format);
+          } catch (error) {
+            console.error('yt-dlp info error:', error);
+            if (isYouTubeBotProtectionError(error?.stderr)) {
+              return res.status(403).json({
+                error:
+                  'YouTube demande une validation "anti-bot" depuis ce serveur. Ajoutez un fichier secrets/youtube-cookies.txt puis réessayez.',
+                code: 'YOUTUBE_AUTH_REQUIRED',
+              });
+            }
+            return res.status(502).json({
+              error: ERROR_MESSAGES.youtubeStreamFailed,
+              code: 'YOUTUBE_STREAM_FAILED',
             });
           }
-          return res.status(502).json({
-            error: ERROR_MESSAGES.youtubeStreamFailed,
-            code: 'YOUTUBE_STREAM_FAILED',
-          });
+          inputs = normalizeYtDlpInputs(ytdlpPayload);
+          storeYouTubeInputsCache({ videoId, format, inputs });
         }
 
-        const inputs = normalizeYtDlpInputs(ytdlpPayload);
         if (inputs.length === 0) {
           return res.status(502).json({
             error: ERROR_MESSAGES.youtubeStreamFailed,

@@ -1,5 +1,8 @@
 :8080 {
-	encode zstd gzip
+	@compressible {
+		not path /api/download*
+	}
+	encode @compressible zstd gzip
 
 	@api path /api /api/*
 	@api_preflight {
