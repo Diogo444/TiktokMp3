@@ -267,6 +267,12 @@ const isYouTubeBotProtectionError = (stderr = '') =>
   typeof stderr === 'string' &&
   /sign in to confirm you.?re not a bot/i.test(stderr);
 
+const isInvalidCookiesFormatError = (stderr = '') =>
+  typeof stderr === 'string' &&
+  /(does not look like a Netscape format cookies file|skipping cookie file entry due to invalid length)/i.test(
+    stderr,
+  );
+
 const isLikelyYouTubeBlockedError = (error) => {
   const message = (error?.message || '').toString();
   const status = Number(error?.statusCode ?? error?.status ?? 0);
@@ -284,34 +290,50 @@ const getYtDlpInfo = async (videoUrl, requestedFormat) => {
       ? 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
       : 'ba[ext=m4a]/ba/b';
 
-  const args = ['-J', '--no-playlist', '--skip-download', '-f', formatSelector];
+  const baseArgs = ['-J', '--no-playlist', '--skip-download', '-f', formatSelector];
 
   if (YTDLP_DISABLE_CACHE) {
-    args.push('--no-cache-dir');
+    baseArgs.push('--no-cache-dir');
   }
 
   const cookiesFile = existsSync(YTDLP_COOKIES_FILE) ? YTDLP_COOKIES_FILE : '';
+  const buildArgs = (withCookies = true) => {
+    const args = [...baseArgs];
+    if (withCookies && cookiesFile) {
+      args.push('--cookies', cookiesFile);
+    }
+    args.push(videoUrl);
+    return args;
+  };
 
-  if (cookiesFile) {
-    args.push('--cookies', cookiesFile);
-  }
-   
   if (!cookiesFile) {
     console.warn('[yt-dlp] No cookies configured - YouTube may block requests');
   }
-  
-  args.push(videoUrl);
-  console.log(
-    `[yt-dlp] Running with args: ${args
-      .filter((entry) => !entry.includes('cookie'))
-      .join(' ')}`,
-  );
 
-  const { stdout, stderr } = await runCommand(
-    YTDLP_BINARY,
-    args,
-    { timeoutMs: YTDLP_TIMEOUT_MS },
-  );
+  const runYtDlp = async (withCookies = true) => {
+    const args = buildArgs(withCookies);
+    console.log(
+      `[yt-dlp] Running with args: ${args
+        .filter((entry) => !entry.includes('cookie'))
+        .join(' ')}`,
+    );
+    return runCommand(YTDLP_BINARY, args, { timeoutMs: YTDLP_TIMEOUT_MS });
+  };
+
+  let stdout = '';
+  let stderr = '';
+  try {
+    ({ stdout, stderr } = await runYtDlp(true));
+  } catch (error) {
+    if (cookiesFile && isInvalidCookiesFormatError(error?.stderr || '')) {
+      console.warn(
+        '[yt-dlp] cookies.txt invalide (BOM/format). Nouvelle tentative sans cookies.',
+      );
+      ({ stdout, stderr } = await runYtDlp(false));
+    } else {
+      throw error;
+    }
+  }
 
   if (stderr?.trim()) {
     console.error('yt-dlp stderr:', stderr.trim());
