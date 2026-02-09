@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 
@@ -20,6 +22,7 @@ const YTDLP_DISABLE_CACHE = true;
 const YTDLP_TIMEOUT_MS = 45000;
 const YOUTUBE_AUDIO_BITRATE = '192k';
 const YTDLP_COOKIES_FILE = '/run/secrets/youtube-cookies.txt';
+const YTDLP_TMP_DIR = join(tmpdir(), 'yt-dlp-runtime');
 
 // Messages d'erreur centralisés pour cohérence
 const ERROR_MESSAGES = {
@@ -273,6 +276,11 @@ const isInvalidCookiesFormatError = (stderr = '') =>
     stderr,
   );
 
+const isCookiesWriteError = (stderr = '') =>
+  typeof stderr === 'string' &&
+  /(read-only file system|permission denied)/i.test(stderr) &&
+  /cookies/i.test(stderr);
+
 const isLikelyYouTubeBlockedError = (error) => {
   const message = (error?.message || '').toString();
   const status = Number(error?.statusCode ?? error?.status ?? 0);
@@ -284,19 +292,62 @@ const isLikelyYouTubeBlockedError = (error) => {
   );
 };
 
+const prepareRuntimeCookiesFile = () => {
+  if (!existsSync(YTDLP_COOKIES_FILE)) {
+    return '';
+  }
+
+  try {
+    mkdirSync(YTDLP_TMP_DIR, { recursive: true });
+    const runtimeFile = join(
+      YTDLP_TMP_DIR,
+      `cookies-${Date.now()}-${crypto.randomInt(1000, 9999)}.txt`,
+    );
+    const rawContent = readFileSync(YTDLP_COOKIES_FILE, 'utf-8');
+    const normalizedContent = rawContent.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+    writeFileSync(runtimeFile, normalizedContent, { encoding: 'utf-8', mode: 0o600 });
+    return runtimeFile;
+  } catch (error) {
+    console.warn(
+      '[yt-dlp] Impossible de preparer le fichier cookies runtime, tentative sans cookies.',
+      error?.message || error,
+    );
+    return '';
+  }
+};
+
+const cleanupRuntimeCookiesFile = (runtimeFile = '') => {
+  if (!runtimeFile) {
+    return;
+  }
+  try {
+    rmSync(runtimeFile, { force: true });
+  } catch {
+    // ignore cleanup failures
+  }
+};
+
 const getYtDlpInfo = async (videoUrl, requestedFormat) => {
   const formatSelector =
     requestedFormat === 'mp4'
       ? 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b'
       : 'ba[ext=m4a]/ba/b';
 
-  const baseArgs = ['-J', '--no-playlist', '--skip-download', '-f', formatSelector];
+  const baseArgs = [
+    '-J',
+    '--no-playlist',
+    '--skip-download',
+    '--js-runtimes',
+    'node',
+    '-f',
+    formatSelector,
+  ];
 
   if (YTDLP_DISABLE_CACHE) {
     baseArgs.push('--no-cache-dir');
   }
 
-  const cookiesFile = existsSync(YTDLP_COOKIES_FILE) ? YTDLP_COOKIES_FILE : '';
+  const cookiesFile = prepareRuntimeCookiesFile();
   const buildArgs = (withCookies = true) => {
     const args = [...baseArgs];
     if (withCookies && cookiesFile) {
@@ -323,16 +374,24 @@ const getYtDlpInfo = async (videoUrl, requestedFormat) => {
   let stdout = '';
   let stderr = '';
   try {
-    ({ stdout, stderr } = await runYtDlp(true));
-  } catch (error) {
-    if (cookiesFile && isInvalidCookiesFormatError(error?.stderr || '')) {
-      console.warn(
-        '[yt-dlp] cookies.txt invalide (BOM/format). Nouvelle tentative sans cookies.',
-      );
-      ({ stdout, stderr } = await runYtDlp(false));
-    } else {
-      throw error;
+    try {
+      ({ stdout, stderr } = await runYtDlp(true));
+    } catch (error) {
+      if (
+        cookiesFile &&
+        (isInvalidCookiesFormatError(error?.stderr || '') ||
+          isCookiesWriteError(error?.stderr || ''))
+      ) {
+        console.warn(
+          '[yt-dlp] Cookies invalides ou non inscriptibles. Nouvelle tentative sans cookies.',
+        );
+        ({ stdout, stderr } = await runYtDlp(false));
+      } else {
+        throw error;
+      }
     }
+  } finally {
+    cleanupRuntimeCookiesFile(cookiesFile);
   }
 
   if (stderr?.trim()) {
