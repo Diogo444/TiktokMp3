@@ -23,6 +23,10 @@ const isInAppBrowser = ref(
     navigator.userAgent,
   ),
 );
+const supportsDownloadAttribute = ref(
+  typeof HTMLAnchorElement !== 'undefined' &&
+    'download' in HTMLAnchorElement.prototype,
+);
 
 const detectPlatform = (value = '') => {
   try {
@@ -210,12 +214,18 @@ const handleDownload = async () => {
   setStatus('loading', 'Lancement du telechargement...');
 
   try {
-    if (isInAppBrowser.value || isIOS.value) {
+    if (isInAppBrowser.value) {
       openDirectInCurrentTab(result.value.downloadUrl);
       setStatus(
-        isInAppBrowser.value ? 'warning' : 'success',
+        'warning',
         compatibilityHint.value || 'Telechargement lance.',
       );
+      return;
+    }
+
+    if (isIOS.value && !supportsDownloadAttribute.value) {
+      openDirectInCurrentTab(result.value.downloadUrl);
+      setStatus('warning', compatibilityHint.value || 'Telechargement lance.');
       return;
     }
 

@@ -308,6 +308,19 @@ const isLikelyYouTubeBlockedError = (error) => {
   );
 };
 
+const isClientDisconnectError = (error) => {
+  const code = (error?.code || '').toString();
+  const message = (error?.message || '').toString();
+  return (
+    code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    /premature close|aborted|socket hang up|connection reset|context canceled/i.test(
+      message,
+    )
+  );
+};
+
 const prepareRuntimeCookiesFile = () => {
   if (!existsSync(YTDLP_COOKIES_FILE)) {
     return '';
@@ -733,6 +746,11 @@ app.post('/api/convert', async (req, res) => {
 });
 
 app.get('/api/download', async (req, res) => {
+  let clientDisconnected = false;
+  req.on('aborted', () => {
+    clientDisconnected = true;
+  });
+
   try {
     const { source, title } = req.query;
 
@@ -870,6 +888,7 @@ app.get('/api/download', async (req, res) => {
 
           res.on('close', () => {
             if (!res.writableEnded) {
+              clientDisconnected = true;
               try {
                 ffmpeg.kill('SIGKILL');
               } catch {
@@ -890,6 +909,10 @@ app.get('/api/download', async (req, res) => {
           });
 
           await Promise.all([outputPipeline, ffmpegExit]).catch((error) => {
+            if (clientDisconnected || isClientDisconnectError(error)) {
+              console.warn('YouTube MP4 stream canceled by client.');
+              return;
+            }
             console.error('YouTube MP4 (yt-dlp) error:', error);
             if (!res.headersSent) {
               res.status(502).json({
@@ -948,6 +971,7 @@ app.get('/api/download', async (req, res) => {
 
         res.on('close', () => {
           if (!res.writableEnded) {
+            clientDisconnected = true;
             try {
               ffmpeg.kill('SIGKILL');
             } catch {
@@ -968,6 +992,10 @@ app.get('/api/download', async (req, res) => {
         });
 
         await Promise.all([outputPipeline, ffmpegExit]).catch((error) => {
+          if (clientDisconnected || isClientDisconnectError(error)) {
+            console.warn('YouTube MP3 stream canceled by client.');
+            return;
+          }
           console.error('YouTube MP3 (yt-dlp) error:', error);
           if (!res.headersSent) {
             res.status(502).json({
@@ -1023,6 +1051,16 @@ app.get('/api/download', async (req, res) => {
 
     await pipeline(upstreamBody, res);
   } catch (error) {
+    if (
+      clientDisconnected ||
+      req.aborted ||
+      res.destroyed ||
+      isClientDisconnectError(error)
+    ) {
+      console.warn('Download stream canceled by client.');
+      return;
+    }
+
     if (error.name === 'AbortError') {
       console.error('Audio upstream timeout:', error);
       return res.status(504).json({
