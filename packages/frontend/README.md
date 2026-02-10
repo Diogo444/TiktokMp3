@@ -39,4 +39,5 @@ pnpm preview
 - Détection automatique de plateforme (YouTube/TikTok)
 - Sélection MP3 ou MP4
 - Affichage de l'état runtime backend (`/api/capabilities`)
-- Téléchargement direct côté navigateur
+- Préparation serveur + polling de job (`/api/jobs/:id`) avant téléchargement direct
+- Fallback automatique vers le lien de streaming direct si la préparation échoue

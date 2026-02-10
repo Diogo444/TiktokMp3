@@ -44,9 +44,23 @@ Détecte automatiquement TikTok vs YouTube et retourne les métadonnées + un li
 - Body: `{ "url": "https://www.tiktok.com/...", "format": "mp4" }`
 - Body: `{ "url": "https://www.youtube.com/watch?v=...", "format": "mp3" }`
 - Body: `{ "url": "https://www.youtube.com/watch?v=...", "format": "mp4" }`
+- Retourne aussi un objet `prepared` (`jobId`, `status`, `statusPath`) pour suivre la préparation serveur du fichier.
+
+### GET /api/jobs/:jobId
+Retourne l'état d'un job de préparation (`processing`, `ready`, `error`).
+- Quand `ready`, la réponse contient `downloadPath` pointant vers `/api/files/:token`.
+
+### GET /api/files/:token
+Téléchargement direct du fichier temporaire préparé sur le serveur.
+- En-têtes: `Content-Disposition`, `Content-Type`, `Content-Length`, `Accept-Ranges`.
+- Support `Range` (`206` / `416`) pour reprise côté navigateur.
+- Le fichier est temporaire et supprimé automatiquement après expiration (TTL).
 
 ### GET /api/download?source=...&title=...
 Télécharge l'audio (mp3) correspondant au `source` renvoyé par `/api/convert`.
+- En-têtes de téléchargement: `Content-Disposition`, `Content-Type`, `Content-Length` (si disponible).
+- TikTok (source directe): support des requêtes `Range` (`206` / `416`) pour améliorer la reprise côté navigateur.
+- YouTube (transcodage live FFmpeg): streaming direct sans reprise `Range` garantie.
 
 ## Politique de stockage
 

@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue';
 
 import { useApi } from './composables/useApi';
 
-const { convert } = useApi();
+const { convert, getJobStatus } = useApi();
 
 const urlValue = ref('');
 const outputFormat = ref('mp3');
@@ -23,10 +23,11 @@ const isInAppBrowser = ref(
     navigator.userAgent,
   ),
 );
-const supportsDownloadAttribute = ref(
-  typeof HTMLAnchorElement !== 'undefined' &&
-    'download' in HTMLAnchorElement.prototype,
+const shouldUseDirectNavigation = computed(
+  () => isInAppBrowser.value || isIOS.value,
 );
+const PREPARED_POLL_INTERVAL_MS = 1500;
+const PREPARED_POLL_TIMEOUT_MS = 3 * 60 * 1000;
 
 const detectPlatform = (value = '') => {
   try {
@@ -105,7 +106,7 @@ const compatibilityHint = computed(() => {
     return 'Le navigateur integre de certaines apps peut bloquer le telechargement. Ouvrez la page dans Safari/Chrome si besoin.';
   }
   if (isIOS.value) {
-    return 'iPhone/iPad: confirmez "Telecharger", puis retrouvez le fichier dans l app Fichiers > Telechargements.';
+    return 'iPhone/iPad: lancez le telechargement et gardez Safari au premier plan pendant le demarrage. Le fichier sera ensuite dans Fichiers > Telechargements.';
   }
   if (isAndroid.value) {
     return 'Android: le fichier apparait dans Telechargements (ou dans le gestionnaire de fichiers).';
@@ -147,6 +148,43 @@ const triggerNativeDownload = (url, fileName = '') => {
   document.body.removeChild(anchor);
 };
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const resolvePreparedDownload = async (prepared, fallbackUrl = '') => {
+  if (!prepared?.jobId) {
+    return {
+      usedPrepared: false,
+      timedOut: false,
+      downloadUrl: fallbackUrl,
+      fileName: '',
+    };
+  }
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < PREPARED_POLL_TIMEOUT_MS) {
+    const payload = await getJobStatus(prepared.jobId);
+    if (payload?.status === 'ready' && payload?.downloadPath) {
+      return {
+        usedPrepared: true,
+        timedOut: false,
+        downloadUrl: toAbsoluteUrl(payload.downloadPath),
+        fileName: payload.fileName || '',
+      };
+    }
+    if (payload?.status === 'error') {
+      throw new Error(payload?.error || 'La preparation du fichier a echoue.');
+    }
+    await sleep(PREPARED_POLL_INTERVAL_MS);
+  }
+
+  return {
+    usedPrepared: false,
+    timedOut: true,
+    downloadUrl: fallbackUrl,
+    fileName: '',
+  };
+};
+
 watch([urlValue, outputFormat], () => {
   if (result.value) {
     result.value = null;
@@ -176,8 +214,55 @@ const handleConvert = async () => {
     const payload = await convert(trimmedUrl, outputFormat.value);
     const media = payload?.audio || payload?.media;
 
-    if (!media?.downloadPath) {
+    if (!media?.downloadPath && !media?.prepared?.jobId) {
       throw new Error('Reponse API incomplete. Reessayez.');
+    }
+
+    const readyFormat = (media.format || outputFormat.value) === 'mp4' ? 'MP4' : 'MP3';
+    const fallbackDownloadUrl = toAbsoluteUrl(media.downloadPath);
+    let resolvedDownloadUrl = fallbackDownloadUrl;
+    let resolvedFileName =
+      media.fileName ||
+      `${media.platform || 'media'}-${Date.now()}.${
+        outputFormat.value === 'mp4' ? 'mp4' : 'mp3'
+      }`;
+    let finalTone = 'success';
+    let finalMessage = `${readyFormat} pret. Telechargez le fichier localement.`;
+
+    if (media?.prepared?.jobId) {
+      setStatus('loading', 'Conversion terminee. Finalisation du fichier sur le serveur...');
+      try {
+        const preparedResult = await resolvePreparedDownload(
+          media.prepared,
+          fallbackDownloadUrl,
+        );
+        if (preparedResult.downloadUrl) {
+          resolvedDownloadUrl = preparedResult.downloadUrl;
+        }
+        if (preparedResult.fileName) {
+          resolvedFileName = preparedResult.fileName;
+        }
+
+        if (preparedResult.usedPrepared) {
+          finalTone = 'success';
+          finalMessage = `${readyFormat} pret (fichier prepare sur le serveur).`;
+        } else if (preparedResult.timedOut && fallbackDownloadUrl) {
+          finalTone = 'warning';
+          finalMessage =
+            'Preparation serveur en cours trop longtemps. Mode direct active en secours.';
+        }
+      } catch (error) {
+        if (!fallbackDownloadUrl) {
+          throw error;
+        }
+        finalTone = 'warning';
+        finalMessage =
+          'Preparation serveur indisponible. Mode direct active en secours.';
+      }
+    }
+
+    if (!resolvedDownloadUrl) {
+      throw new Error('Aucun lien de telechargement disponible.');
     }
 
     result.value = {
@@ -187,16 +272,11 @@ const handleConvert = async () => {
       author: media.author || 'Createur',
       cover: media.cover || '',
       duration: media.duration,
-      fileName:
-        media.fileName ||
-        `${media.platform || 'media'}-${Date.now()}.${
-          outputFormat.value === 'mp4' ? 'mp4' : 'mp3'
-        }`,
-      downloadUrl: toAbsoluteUrl(media.downloadPath),
+      fileName: resolvedFileName,
+      downloadUrl: resolvedDownloadUrl,
     };
 
-    const readyFormat = result.value.format === 'mp4' ? 'MP4' : 'MP3';
-    setStatus('success', `${readyFormat} pret. Telechargez le fichier localement.`);
+    setStatus(finalTone, finalMessage);
   } catch (error) {
     setStatus('error', error?.message || 'La conversion a echoue.');
     result.value = null;
@@ -214,18 +294,12 @@ const handleDownload = async () => {
   setStatus('loading', 'Lancement du telechargement...');
 
   try {
-    if (isInAppBrowser.value) {
+    if (shouldUseDirectNavigation.value) {
       openDirectInCurrentTab(result.value.downloadUrl);
       setStatus(
         'warning',
-        compatibilityHint.value || 'Telechargement lance.',
+        compatibilityHint.value || 'Ouverture du lien direct.',
       );
-      return;
-    }
-
-    if (isIOS.value && !supportsDownloadAttribute.value) {
-      openDirectInCurrentTab(result.value.downloadUrl);
-      setStatus('warning', compatibilityHint.value || 'Telechargement lance.');
       return;
     }
 
@@ -356,11 +430,11 @@ const handleDownload = async () => {
             <a
               class="btn btn--ghost"
               :href="result.downloadUrl"
-              :download="result.fileName"
+              :download="shouldUseDirectNavigation ? null : result.fileName"
               rel="noopener"
               target="_self"
             >
-              Telechargement direct (compatibilite)
+              Lien direct (iPhone/compatibilite)
             </a>
           </div>
         </article>

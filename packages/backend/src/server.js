@@ -1,6 +1,15 @@
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -27,6 +36,14 @@ const YTDLP_TMP_DIR = join(tmpdir(), 'yt-dlp-runtime');
 const YOUTUBE_INPUTS_CACHE_TTL_MS = 10 * 60 * 1000;
 const YOUTUBE_INPUTS_CACHE_MAX_ITEMS = 500;
 const youtubeInputsCache = new Map();
+const PREPARED_DOWNLOADS_DIR = join(tmpdir(), 'tiktokmp3-prepared-downloads');
+const PREPARED_DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+const PREPARED_DOWNLOAD_TTL_MS = 30 * 60 * 1000;
+const PREPARED_ERROR_TTL_MS = 10 * 60 * 1000;
+const PREPARED_POST_ACCESS_TTL_MS = 5 * 60 * 1000;
+const PREPARED_CLEANUP_INTERVAL_MS = 60 * 1000;
+const preparedDownloads = new Map();
+const preparedTokens = new Map();
 
 // Messages d'erreur centralisés pour cohérence
 const ERROR_MESSAGES = {
@@ -82,7 +99,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
   res.setHeader(
     'Access-Control-Expose-Headers',
-    'Content-Disposition, Content-Type, Content-Length',
+    'Content-Disposition, Content-Type, Content-Length, Content-Range, Accept-Ranges, ETag, Last-Modified',
   );
 
   if (req.path.startsWith('/api/')) {
@@ -111,6 +128,18 @@ const buildContentDisposition = (filename = 'media.bin') => {
   return `attachment; filename="${safeName}"; filename*=UTF-8''${encodeRfc5987(
     safeName,
   )}`;
+};
+
+const copyHeaderIfPresent = (
+  upstreamResponse,
+  res,
+  sourceHeaderName,
+  targetHeaderName = sourceHeaderName,
+) => {
+  const value = upstreamResponse.headers.get(sourceHeaderName);
+  if (value) {
+    res.setHeader(targetHeaderName, value);
+  }
 };
 
 const isTikTokUrl = (value = '') => {
@@ -556,10 +585,267 @@ const toNodeReadable = (stream) => {
   return null;
 };
 
+const ensurePreparedDownloadsDir = () => {
+  try {
+    mkdirSync(PREPARED_DOWNLOADS_DIR, { recursive: true });
+    return true;
+  } catch (error) {
+    console.error('Unable to initialize prepared downloads directory:', error);
+    return false;
+  }
+};
+
+const cleanupPreparedDownload = (jobId) => {
+  const job = preparedDownloads.get(jobId);
+  if (!job) {
+    return;
+  }
+
+  preparedDownloads.delete(jobId);
+  preparedTokens.delete(job.token);
+
+  if (job.filePath && typeof job.filePath === 'string') {
+    try {
+      rmSync(job.filePath, { force: true });
+    } catch {
+      // ignore cleanup failures
+    }
+  }
+};
+
+const cleanupExpiredPreparedDownloads = () => {
+  const now = Date.now();
+  for (const [jobId, job] of preparedDownloads.entries()) {
+    if (!job) {
+      preparedDownloads.delete(jobId);
+      continue;
+    }
+
+    const isExpired = now >= Number(job.expiresAt || 0);
+    const isStaleProcessing =
+      job.status === 'processing' &&
+      now - Number(job.createdAt || now) > PREPARED_DOWNLOAD_TIMEOUT_MS + PREPARED_ERROR_TTL_MS;
+
+    if (isExpired || isStaleProcessing) {
+      cleanupPreparedDownload(jobId);
+    }
+  }
+};
+
+const getPreparedDownloadPath = (token = '') => `/api/files/${token}`;
+const getPreparedStatusPath = (jobId = '') => `/api/jobs/${jobId}`;
+
+const formatPreparedJobStatus = (job) => {
+  const payload = {
+    jobId: job.id,
+    status: job.status,
+    platform: job.platform,
+    fileName: job.fileName,
+    format: job.format,
+    title: job.title,
+    author: job.author,
+    cover: job.cover,
+    duration: job.duration,
+    expiresAt: new Date(job.expiresAt).toISOString(),
+    createdAt: new Date(job.createdAt).toISOString(),
+  };
+
+  if (job.status === 'ready') {
+    payload.downloadPath = getPreparedDownloadPath(job.token);
+    payload.size = job.fileSize;
+    payload.contentType = job.mimeType;
+  }
+
+  if (job.status === 'error') {
+    payload.error = job.error || ERROR_MESSAGES.downloadFailed;
+  }
+
+  return payload;
+};
+
+const processPreparedDownload = async (jobId) => {
+  const job = preparedDownloads.get(jobId);
+  if (!job || job.status !== 'processing') {
+    return;
+  }
+
+  if (!ensurePreparedDownloadsDir()) {
+    job.status = 'error';
+    job.error = 'Impossible de preparer le stockage temporaire.';
+    job.updatedAt = Date.now();
+    job.expiresAt = Date.now() + PREPARED_ERROR_TTL_MS;
+    return;
+  }
+
+  const outputPath = join(PREPARED_DOWNLOADS_DIR, `${job.id}.${job.format}`);
+  try {
+    const upstreamResponse = await fetchWithTimeout(
+      `http://127.0.0.1:${PORT}${job.sourcePath}`,
+      { timeout: PREPARED_DOWNLOAD_TIMEOUT_MS },
+    );
+    const upstreamBody = toNodeReadable(upstreamResponse.body);
+    if (!upstreamResponse.ok || !upstreamBody) {
+      throw new Error(
+        `Prepared download upstream failed (${upstreamResponse.status} ${upstreamResponse.statusText})`,
+      );
+    }
+
+    await pipeline(upstreamBody, createWriteStream(outputPath));
+
+    const stats = statSync(outputPath);
+    if (!stats.isFile() || stats.size <= 0) {
+      throw new Error('Prepared download output is empty');
+    }
+
+    const upstreamContentType = upstreamResponse.headers.get('content-type');
+
+    job.filePath = outputPath;
+    job.fileSize = stats.size;
+    job.mimeType =
+      upstreamContentType && upstreamContentType !== 'application/octet-stream'
+        ? upstreamContentType
+        : job.mimeType;
+    job.status = 'ready';
+    job.updatedAt = Date.now();
+    job.expiresAt = Date.now() + PREPARED_DOWNLOAD_TTL_MS;
+  } catch (error) {
+    try {
+      rmSync(outputPath, { force: true });
+    } catch {
+      // ignore cleanup failures
+    }
+
+    job.status = 'error';
+    job.error = ERROR_MESSAGES.downloadFailed;
+    job.updatedAt = Date.now();
+    job.expiresAt = Date.now() + PREPARED_ERROR_TTL_MS;
+    console.error('Prepared download job failed:', error);
+  }
+};
+
+const createPreparedDownload = ({
+  sourcePath,
+  fileName,
+  format,
+  platform,
+  title,
+  author,
+  cover,
+  duration,
+}) => {
+  const now = Date.now();
+  const jobId = crypto.randomBytes(12).toString('hex');
+  const token = crypto.randomBytes(24).toString('base64url');
+  const safeFormat = format === 'mp4' ? 'mp4' : 'mp3';
+  const mimeType = safeFormat === 'mp4' ? 'video/mp4' : 'audio/mpeg';
+  const job = {
+    id: jobId,
+    token,
+    status: 'processing',
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: now + PREPARED_DOWNLOAD_TIMEOUT_MS + PREPARED_ERROR_TTL_MS,
+    sourcePath,
+    fileName,
+    format: safeFormat,
+    platform,
+    title,
+    author,
+    cover,
+    duration,
+    filePath: '',
+    fileSize: 0,
+    mimeType,
+    error: '',
+  };
+
+  preparedDownloads.set(jobId, job);
+  preparedTokens.set(token, jobId);
+
+  processPreparedDownload(jobId).catch((error) => {
+    const currentJob = preparedDownloads.get(jobId);
+    if (!currentJob) {
+      return;
+    }
+    currentJob.status = 'error';
+    currentJob.error = ERROR_MESSAGES.downloadFailed;
+    currentJob.updatedAt = Date.now();
+    currentJob.expiresAt = Date.now() + PREPARED_ERROR_TTL_MS;
+    console.error('Prepared download unexpected failure:', error);
+  });
+
+  return job;
+};
+
+const parseSingleByteRange = (rawRange, fileSize) => {
+  if (!rawRange) {
+    return { kind: 'none' };
+  }
+
+  if (typeof rawRange !== 'string' || !rawRange.startsWith('bytes=')) {
+    return { kind: 'invalid' };
+  }
+
+  const withoutUnit = rawRange.slice(6).trim();
+  if (!withoutUnit || withoutUnit.includes(',')) {
+    return { kind: 'invalid' };
+  }
+
+  const [startText, endText] = withoutUnit.split('-');
+  const hasStart = startText !== '';
+  const hasEnd = endText !== '';
+
+  if (!hasStart && !hasEnd) {
+    return { kind: 'invalid' };
+  }
+
+  let start = 0;
+  let end = fileSize - 1;
+
+  if (hasStart) {
+    start = Number(startText);
+    if (!Number.isInteger(start) || start < 0) {
+      return { kind: 'invalid' };
+    }
+
+    if (hasEnd) {
+      end = Number(endText);
+      if (!Number.isInteger(end) || end < start) {
+        return { kind: 'invalid' };
+      }
+    }
+  } else {
+    const suffixLength = Number(endText);
+    if (!Number.isInteger(suffixLength) || suffixLength <= 0) {
+      return { kind: 'invalid' };
+    }
+    start = Math.max(fileSize - suffixLength, 0);
+    end = fileSize - 1;
+  }
+
+  if (start >= fileSize) {
+    return { kind: 'unsatisfiable' };
+  }
+
+  end = Math.min(end, fileSize - 1);
+  return { kind: 'range', start, end };
+};
+
+ensurePreparedDownloadsDir();
+cleanupExpiredPreparedDownloads();
+const preparedCleanupTimer = setInterval(
+  cleanupExpiredPreparedDownloads,
+  PREPARED_CLEANUP_INTERVAL_MS,
+);
+if (typeof preparedCleanupTimer.unref === 'function') {
+  preparedCleanupTimer.unref();
+}
+
 const getRuntimeCapabilities = () => {
   const ffmpegPath = resolveFfmpegPath();
   return {
-    streamingOnly: true,
+    streamingOnly: false,
+    preparedDownloads: true,
     formats: ['mp3', 'mp4'],
     platforms: ['tiktok', 'youtube'],
     binaries: {
@@ -688,6 +974,19 @@ app.post('/api/convert', async (req, res) => {
         format,
         url: tiktokSourceUrl,
       });
+      const directStreamPath = `/api/download?source=${encodedSource}&title=${encodeURIComponent(
+        safeTitle,
+      )}`;
+      const preparedJob = createPreparedDownload({
+        sourcePath: directStreamPath,
+        fileName: `${safeTitle}.${format}`,
+        format,
+        platform,
+        title,
+        author,
+        cover: data.cover,
+        duration: data.duration,
+      });
 
       res.json({
         success: true,
@@ -699,9 +998,11 @@ app.post('/api/convert', async (req, res) => {
           cover: data.cover,
           duration: data.duration,
           fileName: `${safeTitle}.${format}`,
-          downloadPath: `/api/download?source=${encodedSource}&title=${encodeURIComponent(
-            safeTitle,
-          )}`,
+          downloadPath: directStreamPath,
+          prepared: {
+            ...formatPreparedJobStatus(preparedJob),
+            statusPath: getPreparedStatusPath(preparedJob.id),
+          },
         },
         meta: {
           id: data.id,
@@ -790,6 +1091,19 @@ app.post('/api/convert', async (req, res) => {
       id: videoId,
       ...(cacheKey ? { cacheKey } : {}),
     });
+    const directStreamPath = `/api/download?source=${encodedSource}&title=${encodeURIComponent(
+      safeTitle,
+    )}`;
+    const preparedJob = createPreparedDownload({
+      sourcePath: directStreamPath,
+      fileName: `${safeTitle}.${format}`,
+      format,
+      platform,
+      title,
+      author,
+      cover,
+      duration,
+    });
 
     res.json({
       success: true,
@@ -801,9 +1115,11 @@ app.post('/api/convert', async (req, res) => {
         cover,
         duration,
         fileName: `${safeTitle}.${format}`,
-        downloadPath: `/api/download?source=${encodedSource}&title=${encodeURIComponent(
-          safeTitle,
-        )}`,
+        downloadPath: directStreamPath,
+        prepared: {
+          ...formatPreparedJobStatus(preparedJob),
+          statusPath: getPreparedStatusPath(preparedJob.id),
+        },
       },
       meta: {
         id: videoId,
@@ -827,6 +1143,136 @@ app.post('/api/convert', async (req, res) => {
       code: 'SERVER_ERROR',
     });
   }
+});
+
+app.get('/api/jobs/:jobId', (req, res) => {
+  cleanupExpiredPreparedDownloads();
+  const jobId = (req.params.jobId || '').toString().trim();
+  if (!jobId) {
+    return res
+      .status(400)
+      .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'JOB_ID_MISSING' });
+  }
+
+  const job = preparedDownloads.get(jobId);
+  if (!job) {
+    return res
+      .status(404)
+      .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'JOB_NOT_FOUND' });
+  }
+
+  if (Date.now() >= job.expiresAt) {
+    cleanupPreparedDownload(job.id);
+    return res
+      .status(410)
+      .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'JOB_EXPIRED' });
+  }
+
+  return res.json({
+    success: true,
+    ...formatPreparedJobStatus(job),
+  });
+});
+
+app.get('/api/files/:token', (req, res) => {
+  cleanupExpiredPreparedDownloads();
+  const token = (req.params.token || '').toString().trim();
+  if (!token) {
+    return res
+      .status(400)
+      .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'TOKEN_MISSING' });
+  }
+
+  const jobId = preparedTokens.get(token);
+  if (!jobId) {
+    return res
+      .status(404)
+      .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'TOKEN_INVALID' });
+  }
+
+  const job = preparedDownloads.get(jobId);
+  if (!job || job.status !== 'ready' || !job.filePath || !existsSync(job.filePath)) {
+    return res
+      .status(404)
+      .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'FILE_NOT_READY' });
+  }
+
+  if (Date.now() >= job.expiresAt) {
+    cleanupPreparedDownload(job.id);
+    return res
+      .status(410)
+      .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'FILE_EXPIRED' });
+  }
+
+  let stats;
+  try {
+    stats = statSync(job.filePath);
+  } catch (error) {
+    cleanupPreparedDownload(job.id);
+    return res
+      .status(404)
+      .json({ error: ERROR_MESSAGES.sourceInvalid, code: 'FILE_NOT_FOUND' });
+  }
+
+  const fileSize = stats.size;
+  job.fileSize = fileSize;
+
+  const byteRange = parseSingleByteRange(req.headers.range, fileSize);
+  if (byteRange.kind === 'invalid' || byteRange.kind === 'unsatisfiable') {
+    res.status(416);
+    res.setHeader('Content-Range', `bytes */${fileSize}`);
+    res.setHeader('Accept-Ranges', 'bytes');
+    return res.end();
+  }
+
+  res.setHeader('Content-Type', job.mimeType || 'application/octet-stream');
+  res.setHeader('Content-Disposition', buildContentDisposition(job.fileName));
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Accept-Ranges', 'bytes');
+
+  let stream = null;
+  if (byteRange.kind === 'range') {
+    const chunkSize = byteRange.end - byteRange.start + 1;
+    res.status(206);
+    res.setHeader(
+      'Content-Range',
+      `bytes ${byteRange.start}-${byteRange.end}/${fileSize}`,
+    );
+    res.setHeader('Content-Length', String(chunkSize));
+    stream = createReadStream(job.filePath, {
+      start: byteRange.start,
+      end: byteRange.end,
+    });
+  } else {
+    res.status(200);
+    res.setHeader('Content-Length', String(fileSize));
+    stream = createReadStream(job.filePath);
+  }
+
+  stream.on('error', (error) => {
+    console.error('Prepared file stream error:', error);
+    if (!res.headersSent) {
+      res.status(500).end();
+      return;
+    }
+    res.destroy(error);
+  });
+
+  res.on('close', () => {
+    if (stream) {
+      stream.destroy();
+    }
+  });
+
+  res.on('finish', () => {
+    if (res.statusCode === 200 || res.statusCode === 206) {
+      const now = Date.now();
+      job.updatedAt = now;
+      job.expiresAt = Math.min(job.expiresAt, now + PREPARED_POST_ACCESS_TTL_MS);
+    }
+  });
+
+  stream.pipe(res);
 });
 
 app.get('/api/download', async (req, res) => {
@@ -974,6 +1420,7 @@ app.get('/api/download', async (req, res) => {
             buildContentDisposition(`${safeTitle}.mp4`),
           );
           res.setHeader('Cache-Control', 'no-store');
+          res.setHeader('Accept-Ranges', 'none');
 
           ffmpeg.stderr.on('data', (chunk) => {
             const message = chunk?.toString?.() || '';
@@ -1057,6 +1504,7 @@ app.get('/api/download', async (req, res) => {
           buildContentDisposition(`${safeTitle}.mp3`),
         );
         res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Accept-Ranges', 'none');
 
         ffmpeg.stderr.on('data', (chunk) => {
           const message = chunk?.toString?.() || '';
@@ -1124,12 +1572,32 @@ app.get('/api/download', async (req, res) => {
       });
     }
 
+    const rangeHeader =
+      typeof req.headers.range === 'string' && req.headers.range.trim()
+        ? req.headers.range.trim()
+        : '';
     const upstreamResponse = await fetchWithTimeout(upstreamUrl, {
       timeout: AUDIO_TIMEOUT_MS,
+      headers: rangeHeader ? { Range: rangeHeader } : undefined,
     });
 
     const upstreamBody = toNodeReadable(upstreamResponse.body);
-    if (!upstreamResponse.ok || !upstreamBody) {
+    if (upstreamResponse.status === 416) {
+      const fileExt = format === 'mp4' ? 'mp4' : 'mp3';
+      res.status(416);
+      res.setHeader(
+        'Content-Disposition',
+        buildContentDisposition(`${safeTitle}.${fileExt}`),
+      );
+      res.setHeader('Accept-Ranges', 'bytes');
+      copyHeaderIfPresent(upstreamResponse, res, 'content-range', 'Content-Range');
+      return res.end();
+    }
+
+    if (
+      (upstreamResponse.status !== 200 && upstreamResponse.status !== 206) ||
+      !upstreamBody
+    ) {
       console.error(
         'Audio upstream error:',
         upstreamResponse.status,
@@ -1143,12 +1611,26 @@ app.get('/api/download', async (req, res) => {
 
     const contentType = format === 'mp4' ? 'video/mp4' : 'audio/mpeg';
     const fileExt = format === 'mp4' ? 'mp4' : 'mp3';
+    const upstreamContentType = upstreamResponse.headers.get('content-type');
+    const upstreamAcceptRanges = upstreamResponse.headers.get('accept-ranges');
 
+    res.status(upstreamResponse.status);
     res.setHeader('Content-Type', contentType);
+    if (upstreamContentType && upstreamContentType !== 'application/octet-stream') {
+      res.setHeader('Content-Type', upstreamContentType);
+    }
     res.setHeader(
       'Content-Disposition',
       buildContentDisposition(`${safeTitle}.${fileExt}`),
     );
+    res.setHeader(
+      'Accept-Ranges',
+      upstreamAcceptRanges || (upstreamResponse.status === 206 ? 'bytes' : 'none'),
+    );
+    copyHeaderIfPresent(upstreamResponse, res, 'content-length', 'Content-Length');
+    copyHeaderIfPresent(upstreamResponse, res, 'content-range', 'Content-Range');
+    copyHeaderIfPresent(upstreamResponse, res, 'etag', 'ETag');
+    copyHeaderIfPresent(upstreamResponse, res, 'last-modified', 'Last-Modified');
 
     await pipeline(upstreamBody, res);
   } catch (error) {

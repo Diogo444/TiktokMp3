@@ -71,6 +71,12 @@ export function useApi() {
       body: { url, format },
     });
 
+  const getJobStatus = (jobId) =>
+    request(`/jobs/${encodeURIComponent(jobId)}`, {
+      method: 'GET',
+      timeout: 15000,
+    });
+
   const getCapabilities = () =>
     request('/capabilities', {
       method: 'GET',
@@ -88,6 +94,7 @@ export function useApi() {
     error,
     request,
     convert,
+    getJobStatus,
     getCapabilities,
     checkHealth,
   };
